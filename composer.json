@@ -1,0 +1,54 @@
+{
+    "name": "wordplus/realtime-php",
+    "description": "WordPlus Cloud's realtime SDK for PHP and Laravel outside WordPress: rooms with presence and history, events to rooms and users, webhooks, calls between two people that ring in the browser, group calls, sealed end to end. Signs what the browser package (@wordplus/realtime) asks for, emits, and plugs into Laravel's broadcasting.",
+    "keywords": ["realtime", "websocket", "rooms", "presence", "webrtc", "video calls", "laravel", "broadcasting", "end-to-end encryption"],
+    "type": "library",
+    "license": "MIT",
+    "homepage": "https://docs.wordplus.cloud/laravel/getting-started/",
+    "authors": [
+        { "name": "WordPlus", "homepage": "https://www.wordplus.cloud/" }
+    ],
+    "support": {
+        "docs": "https://docs.wordplus.cloud/apps/php-reference/",
+        "source": "https://github.com/wordplus-cloud/realtime-php"
+    },
+    "require": {
+        "php": ">=8.1",
+        "ext-json": "*",
+        "ext-sodium": "*"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^10.0",
+        "phpunit/phpunit": "^11.5"
+    },
+    "suggest": {
+        "ext-curl": "Publishing over curl; PHP's streams are used without it"
+    },
+    "autoload": {
+        "psr-4": {
+            "WordPlus\\Realtime\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "WordPlus\\Realtime\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "WordPlus\\Realtime\\Laravel\\RealtimeServiceProvider"
+            ],
+            "aliases": {
+                "Realtime": "WordPlus\\Realtime\\Laravel\\Facades\\Realtime"
+            }
+        }
+    },
+    "scripts": {
+        "test": "phpunit"
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable"
+}

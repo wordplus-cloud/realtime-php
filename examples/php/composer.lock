@@ -1,0 +1,100 @@
+{
+    "_readme": [
+        "This file locks the dependencies of your project to a known state",
+        "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
+        "This file is @generated automatically"
+    ],
+    "content-hash": "340bc1b8205e72f8103a983cc8e0345d",
+    "packages": [
+        {
+            "name": "wordplus/realtime-php",
+            "version": "dev-main",
+            "dist": {
+                "type": "path",
+                "url": "../..",
+                "reference": "87bfb9284c877f9ee827c37b8bafa5873d317a31"
+            },
+            "require": {
+                "ext-json": "*",
+                "ext-sodium": "*",
+                "php": ">=8.1"
+            },
+            "require-dev": {
+                "orchestra/testbench": "^10.0",
+                "phpunit/phpunit": "^11.5"
+            },
+            "suggest": {
+                "ext-curl": "Publishing over curl; PHP's streams are used without it"
+            },
+            "type": "library",
+            "extra": {
+                "laravel": {
+                    "providers": [
+                        "WordPlus\\Realtime\\Laravel\\RealtimeServiceProvider"
+                    ],
+                    "aliases": {
+                        "Realtime": "WordPlus\\Realtime\\Laravel\\Facades\\Realtime"
+                    }
+                }
+            },
+            "autoload": {
+                "psr-4": {
+                    "WordPlus\\Realtime\\": "src/"
+                }
+            },
+            "autoload-dev": {
+                "psr-4": {
+                    "WordPlus\\Realtime\\Tests\\": "tests/"
+                }
+            },
+            "scripts": {
+                "test": [
+                    "phpunit"
+                ]
+            },
+            "license": [
+                "MIT"
+            ],
+            "authors": [
+                {
+                    "name": "WordPlus",
+                    "homepage": "https://www.wordplus.cloud/"
+                }
+            ],
+            "description": "WordPlus Cloud's realtime SDK for PHP and Laravel outside WordPress: channels, presence and events, calls between two people that ring in the browser, group calls, sealed end to end. Signs what the browser package (@wordplus/realtime) asks for, publishes, and plugs into Laravel's broadcasting.",
+            "homepage": "https://docs.wordplus.cloud/apps/laravel/",
+            "keywords": [
+                "broadcasting",
+                "channels",
+                "end-to-end encryption",
+                "laravel",
+                "presence",
+                "realtime",
+                "video calls",
+                "webrtc",
+                "websocket"
+            ],
+            "support": {
+                "docs": "https://docs.wordplus.cloud/apps/php-reference/",
+                "source": "https://github.com/wordplus-cloud/realtime-php"
+            },
+            "transport-options": {
+                "symlink": false,
+                "relative": true
+            }
+        }
+    ],
+    "packages-dev": [],
+    "aliases": [],
+    "minimum-stability": "stable",
+    "stability-flags": {
+        "wordplus/realtime-php": 20
+    },
+    "prefer-stable": true,
+    "prefer-lowest": false,
+    "platform": {
+        "php": ">=8.1"
+    },
+    "platform-dev": [],
+    "plugin-api-version": "2.6.0"
+}

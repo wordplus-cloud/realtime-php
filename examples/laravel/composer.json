@@ -1,0 +1,60 @@
+{
+    "$schema": "https://getcomposer.org/schema.json",
+    "name": "wordplus/realtime-laravel-example",
+    "type": "project",
+    "description": "The API demo on Laravel: the broadcasting driver of wordplus/realtime-php, routes/channels.php, events, presence, calls and group calls.",
+    "license": "MIT",
+    "repositories": [
+        { "type": "path", "url": "../..", "options": { "symlink": false } }
+    ],
+    "require": {
+        "php": "^8.3",
+        "laravel/framework": "^13.17",
+        "laravel/tinker": "^3.0",
+        "wordplus/realtime-php": "*@dev"
+    },
+    "require-dev": {
+        "laravel/pail": "^1.2.5",
+        "laravel/pint": "^1.27",
+        "nunomaduro/collision": "^8.6"
+    },
+    "autoload": {
+        "psr-4": {
+            "App\\": "app/",
+            "Database\\Seeders\\": "database/seeders/"
+        }
+    },
+    "scripts": {
+        "setup": [
+            "composer install",
+            "@php -r \"file_exists('.env') || copy('.env.example', '.env');\"",
+            "@php artisan key:generate",
+            "@php -r \"file_exists('database/database.sqlite') || touch('database/database.sqlite');\"",
+            "@php artisan migrate:fresh --seed --force",
+            "npm install --ignore-scripts",
+            "npm run build"
+        ],
+        "post-autoload-dump": [
+            "Illuminate\\Foundation\\ComposerScripts::postAutoloadDump",
+            "@php artisan package:discover --ansi"
+        ],
+        "pre-package-uninstall": [
+            "Illuminate\\Foundation\\ComposerScripts::prePackageUninstall"
+        ]
+    },
+    "extra": {
+        "laravel": {
+            "dont-discover": []
+        }
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "preferred-install": "dist",
+        "sort-packages": true,
+        "allow-plugins": {
+            "php-http/discovery": true
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

@@ -1,0 +1,15 @@
+{
+    "name": "wordplus/realtime-php-example",
+    "type": "project",
+    "description": "The API demo in plain PHP: the routes, channels, presence, publishing, calls and group calls of wordplus/realtime-php, without a framework.",
+    "license": "MIT",
+    "repositories": [
+        { "type": "path", "url": "../..", "options": { "symlink": false } }
+    ],
+    "require": {
+        "php": ">=8.1",
+        "wordplus/realtime-php": "*@dev"
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
