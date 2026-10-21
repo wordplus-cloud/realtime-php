@@ -1,6 +1,6 @@
 # wordplus/realtime-php
 
-WordPlus Cloud's realtime SDK for PHP and Laravel, outside WordPress: your server's part of rooms, presence, who is online, calls and group calls, sealed end to end. It declares your rooms and who may join, call and see what, signs it for the browser, and sends your events to rooms and to users. The browser part is the npm package [`@wordplus/realtime`](https://docs.wordplus.cloud/apps/browser/), with Better Messages' chat, list of who is online and call screen as ready-made parts.
+WordPlus Cloud's realtime SDK for PHP and Laravel, outside WordPress: your server's part of rooms, presence, who is online, calls and group calls, sealed end to end. It declares your rooms and who may join, call and see what, signs it for the browser, and sends your events to rooms and to users. The browser part is the npm package [`@wordplus/realtime`](https://docs.wordplus.cloud/apps/browser/), with the chat, the list of who is online and the call screen of Better Messages as ready-made parts.
 
 **Docs:** a whole guide each for [Laravel](https://docs.wordplus.cloud/laravel/getting-started/) and for [PHP without a framework](https://docs.wordplus.cloud/php/getting-started/) (in this package: [docs/laravel](docs/laravel/getting-started.md), [docs/php](docs/php/getting-started.md)), and the [PHP reference](docs/reference.md).
 
@@ -14,7 +14,7 @@ composer require wordplus/realtime-php
 
 It carries the browser files too, the client as an ES module among them, and its routes serve them, so a PHP app needs no Node: `$realtime->head( $userId )` in a page head names `@wordplus/realtime` the client by an import map. With a bundler of your own, `npm install @wordplus/realtime`. Both are also on WordPlus's own mirror, for a network that can't reach Packagist or npm. For Composer, add it with `composer config repositories.wordplus composer https://packages.wordplus.cloud/composer`. For npm, install `https://packages.wordplus.cloud/npm/wordplus-realtime-1.0.0.tgz`.
 
-Your app in your WordPlus Cloud account (Apps) gives you its key and secret; the local key is your own and never leaves your servers:
+Your app in your WordPlus Cloud account (Apps) gives you its key and secret. The local key is your own and never leaves your servers:
 
 ```dotenv
 WORDPLUS_SITE=s1500000007
@@ -62,7 +62,7 @@ $this->callAfterResolving( Realtime::class, function ( Realtime $realtime ) {
 } );
 ```
 
-The routes are `POST /wordplus/realtime/auth`, `/calls` and `/keys` on the `web` middleware: the session's user; and `/webhook`, which the realtime server signs. A user's name (and `avatar`, or Jetstream's `profile_photo_url`) is what the others see; `RealtimeServiceProvider::profileUsing( fn ( $id ) => [ 'name' => …, 'avatar' => … ] )` says otherwise, and `hiddenUsing()` who is never shown online. `php artisan vendor:publish --tag=wordplus-realtime` copies the config.
+The routes are `POST /wordplus/realtime/auth`, `/calls` and `/keys` on the `web` middleware, which give the session's user, and `/webhook`, which the realtime server signs. A user's name (and `avatar`, or Jetstream's `profile_photo_url`) is what the others see. `RealtimeServiceProvider::profileUsing( fn ( $id ) => [ 'name' => …, 'avatar' => … ] )` says otherwise, and `hiddenUsing()` who is never shown online. `php artisan vendor:publish --tag=wordplus-realtime` copies the config.
 
 ## Plain PHP
 

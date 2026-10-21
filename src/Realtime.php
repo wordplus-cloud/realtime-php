@@ -25,7 +25,7 @@ namespace WordPlus\Realtime;
  */
 final class Realtime
 {
-    public const VERSION = '1.0.0';
+    public const VERSION = '1.0.1';
 
     /** The largest id of digits a page reads as the same number (JavaScript's Number.MAX_SAFE_INTEGER). */
     private const MAX_SAFE_INTEGER = 9007199254740991;
