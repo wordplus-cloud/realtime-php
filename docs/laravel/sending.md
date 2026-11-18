@@ -2,7 +2,9 @@
 
 Your app sends events to rooms and to users: broadcast events, or the facade straight. Everyone in the room gets them, sealed on the way, and a room that keeps history keeps them.
 
-## Broadcast events
+## To a room
+
+A broadcast event names its rooms by their channels: `PrivateChannel( 'orders.1042' )` is the room `orders.1042`.
 
 ```php
 namespace App\Events;
@@ -37,25 +39,30 @@ class OrderUpdated implements ShouldBroadcast
 ```
 
 ```php
-public function status( Request $request, Order $order )
-{
-    $order->update( $request->validate( [ 'status' => [ 'required', Rule::in( Order::STATUSES ) ] ] ) );
-
-    // Everyone in the room but the tab whose request this is, which shows the change already.
-    broadcast( new OrderUpdated( $order ) )->toOthers();
-
-    return response()->json( [ 'ok' => true ] );
-}
+$order->update( [ 'status' => 'shipped' ] );
+broadcast( new OrderUpdated( $order ) );
 ```
 
 - **The event name** is the one `broadcastAs()` returns, or else its class.
 - **Its data** is what `broadcastWith()` returns, or else its public properties: up to 1 MB, sealed with the room key.
+- **Binary:** `new WordPlus\Realtime\Binary( $bytes )` anywhere in the data. A page gets it as a `Uint8Array`. A string of bytes that aren't UTF-8 can't go as it is: encoding it throws.
 - **Timing:** `ShouldBroadcast` goes through your queue (run a worker), `ShouldBroadcastNow` during the request.
 - **Failures:** a refusal from WordPlus Cloud throws the Laravel `BroadcastException`, with the [code](https://docs.wordplus.cloud/apps/errors/) in its message. Broadcast after your change is saved: a failed broadcast is a missed live update, not a lost change.
 
-## `toOthers()`
+The facade sends the same way, with the chain every package has, to one room or up to 1,000:
 
-It skips the tab whose request caused the event, when the page sends its tab as `X-Realtime-Tab`:
+```php
+use WordPlus\Realtime\Laravel\Facades\Realtime;
+
+Realtime::to( 'orders.1042' )->emit( 'updated', [ 'status' => 'shipped' ] );
+Realtime::to( [ 'orders.1042', 'staff' ] )->emit( 'updated', [ 'status' => 'shipped' ] );
+```
+
+A refusal there throws `RealtimeError`, with its `errorCode`: `too_large`, `too_many`, `reserved` (one of the [reserved names](https://docs.wordplus.cloud/apps/errors/#reserved-names)), `bad_room`.
+
+## Not back to the tab that made it
+
+A page that made the change already shows it. `toOthers()` skips the tab whose request caused the event, when the page sends its tab as `X-Realtime-Tab`:
 
 ```js
 await fetch( `/orders/${ id }/status`, {
@@ -71,30 +78,49 @@ await fetch( `/orders/${ id }/status`, {
 // With axios, once: axios.defaults.headers.common[ 'X-Realtime-Tab' ] = rt.tab
 ```
 
-## With the facade
+```php
+public function status( Request $request, Order $order )
+{
+    $order->update( $request->validate( [ 'status' => [ 'required', Rule::in( Order::STATUSES ) ] ] ) );
 
-The same chain as in every package:
+    // Everyone in the room but the tab whose request this is, which shows the change already.
+    broadcast( new OrderUpdated( $order ) )->toOthers();
+
+    return response()->json( [ 'ok' => true ] );
+}
+```
+
+With the facade, `except()` names the tab:
 
 ```php
-use WordPlus\Realtime\Laravel\Facades\Realtime;
-
-Realtime::to( 'orders.1042' )->emit( 'updated', [ 'status' => 'shipped' ] );
 Realtime::to( [ 'orders.1042', 'staff' ] )->except( $request->header( 'X-Realtime-Tab' ) )->emit( 'updated', [ 'status' => 'shipped' ] );
+```
 
-// Every tab and device a user has open, sealed with their own key:
+## To a user
+
+Every tab and device a user has open, wherever they are in your app:
+
+```php
 Realtime::toUser( $order->customer_id )->emit( 'notice', [ 'text' => 'Your order shipped' ] );
-
-Realtime::batch( [
-    [ 'rooms' => 'orders.1042', 'event' => 'updated', 'data' => [ 'status' => 'shipped' ] ],
-    [ 'users' => 42, 'event' => 'notice', 'data' => [ 'text' => 'Your order shipped' ] ],
-] );   // 100 events a request
+Realtime::toUser( [ 42, 43 ] )->to( 'staff' )->emit( 'notice', [ 'text' => 'A new order' ] );
 ```
 
 ```js
 rt.on( 'notice', ( data ) => toast( data.text ) );   // on the page, for its signed-in user
 ```
 
-A refusal throws `RealtimeError`, with its `errorCode`: `too_large`, `too_many`, `reserved`, `bad_room`.
+It is sealed with the key of the user, so only their pages read it. A user with nothing open gets nothing: send an email for what must reach them.
+
+## Many at once
+
+```php
+Realtime::batch( [
+    [ 'rooms' => 'orders.1042', 'event' => 'updated', 'data' => [ 'status' => 'shipped' ] ],
+    [ 'users' => 42, 'event' => 'notice', 'data' => [ 'text' => 'Your order shipped' ] ],
+] );
+```
+
+Up to 100 events a call.
 
 ## Asking about a room
 
@@ -119,18 +145,33 @@ $replies = Realtime::user( 42 )->ask( 'cart', [ 'why' => 'checkout' ] );     // 
 
 ## Webhooks
 
-Your app can hear what happens in rooms. Set the address on your app page in your WordPlus Cloud account (on your computer, through a tunnel: [while you develop](https://docs.wordplus.cloud/apps/sending/#while-you-develop)), `https://shop.example.com/wordplus/realtime/webhook`, which the package answers, outside the `web` middleware:
+Your app can hear what happens in rooms. Set the address on your app page in your WordPlus Cloud account (on your computer, through a tunnel: [while you develop](https://docs.wordplus.cloud/apps/sending/#while-you-develop)), `https://shop.example.com/wordplus/realtime/webhook`, which the package answers, outside the `web` middleware. The channel of a room names the events of its pages that come here too (`webhook`), and `$realtime->on()` gives each event, by its name, a handler of yours. Here:
+
+1. **The chat of two**, such as `chat.34.42`, sends its messages here too.
+2. **Each message** is kept once, by its `event_id`, from signed-in people alone.
+3. **A user going offline** is marked away.
 
 ```php
-// routes/channels.php: a room says which events of the pages come here too
+// routes/channels.php
+// 1. The chat of two sends its messages here too. $isOneOf is its callback, as in rooms.
 Broadcast::channel( 'chat.{a}.{b}', $isOneOf, [ 'history' => 50, 'emit' => [ 'message', 'typing' ], 'webhook' => [ 'message' ] ] );
 ```
 
 ```php
-// the boot() of a service provider
+// the boot() of a service provider. Message is the model of events.md.
+use WordPlus\Realtime\Realtime;
+
 $this->callAfterResolving( Realtime::class, function ( Realtime $realtime ) {
-    // A guest in a public room sends with no `from`: kept from signed-in people alone. Message is the model of events.md.
-    $realtime->on( 'message', fn ( array $e ) => isset( $e['from'] ) && Message::firstOrCreate( [ 'event_id' => $e['event_id'] ], [ 'room' => $e['room'], 'from_id' => $e['from'], 'text' => $e['data']['text'] ] ) );
+    // 2. Each message, kept once by its event_id: a repeat has the same one.
+    $realtime->on( 'message', function ( array $e ) {
+        // A guest in a public room sends with no `from`: kept from signed-in people alone.
+        if ( ! isset( $e['from'] ) ) {
+            return;
+        }
+        Message::firstOrCreate( [ 'event_id' => $e['event_id'] ], [ 'room' => $e['room'], 'from_id' => $e['from'], 'text' => $e['data']['text'] ] );
+    } );
+
+    // 3. A user going offline.
     $realtime->on( 'user.offline', fn ( array $e ) => User::whereKey( $e['user'] )->update( [ 'away' => true ] ) );
 } );
 ```
@@ -138,5 +179,14 @@ $this->callAfterResolving( Realtime::class, function ( Realtime $realtime ) {
 - **What comes:** the page events a room names in `webhook`, by their name. `room.occupied` and `room.vacated`. `member.joined` and `member.left`. `user.online` and `user.offline`. `stream.live` and `stream.ended`, a live stream going live and ending, with its name in `stream`. `call.ended`, `group.joined`, `group.left`, `stream.joined` and `stream.left`, what people used, with how long once it is over, to charge them by ([charging for calls and streams](https://docs.wordplus.cloud/use-cases/charging/)). `'*'` gets them all.
 - **Checked and opened:** each request is signed, and checked before your handler sees it. Sealed data comes opened.
 - **At least once:** each event has its id, so a repeat can be dropped. A request that fails is tried again for 24 hours.
+
+## Use cases
+
+Each with the rules of your server and the code of the page:
+
+- [Live updates and notifications](https://docs.wordplus.cloud/use-cases/live-updates/): an order moving on, and a notice to one user in every tab
+- [Every page and app of a user](https://docs.wordplus.cloud/use-cases/devices/): `ask()` and `rt.answer()`, and taking a user out of everything at once
+- [Charging for calls and streams](https://docs.wordplus.cloud/use-cases/charging/): what each person used, from the webhook
+- [Members-only streams](https://docs.wordplus.cloud/use-cases/members-only/): telling the members by `toUser()` when a stream goes live
 
 More, with Node and Python side by side: [sending in depth](https://docs.wordplus.cloud/apps/sending/).

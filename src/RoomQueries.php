@@ -68,15 +68,67 @@ final class RoomQueries
         return (int) ($this->realtime->request('DELETE', $path)['deleted'] ?? 0);
     }
 
-    /** Takes a user out of the room at once, refuses their tokens signed before, and moves the room's key on when keys have generations. */
-    public function kick(int|string $user): void
+    /**
+     * Sends to the room, as `to( $room )->emit()` does: the kept event ids, by room.
+     *
+     * @param array{seal?: bool} $options
+     * @return array<string, string>
+     */
+    public function emit(string $event, mixed $data = null, array $options = []): array
     {
-        $this->realtime->request('POST', '/wordplus/realtime/rooms/'.rawurlencode($this->room).'/kick', ['user' => (string) $user]);
+        return $this->realtime->to($this->room)->emit($event, $data, $options);
+    }
+
+    /**
+     * Takes a user out of the room at once, refuses their tokens signed before, and moves the room's key on when keys have
+     * generations. A reload asks the room's rule again, so to keep them out, the rule says no for them too.
+     */
+    public function remove(int|string $user): void
+    {
+        $this->about('kick', ['user' => (string) $user]);
+    }
+
+    /**
+     * Takes everyone out of the room at once, on every server, each page hearing `kicked`, as `remove()` does for one. Those
+     * your rule still lets in can join again, so to close the room, have the rule say no first. A public room takes anyone
+     * back, as it always does.
+     */
+    public function removeEveryone(): void
+    {
+        $this->about('kick', ['everyone' => true]);
+    }
+
+    /**
+     * Asks the room's rule again for a user, in this room alone: their pages leave it and ask your server again by themselves,
+     * and come back with what the rule answers now, or hear why not. For a role that changed, such as a member made a reader.
+     * The others in the room see them leave and join again. Their other rooms and calls are left alone.
+     */
+    public function recheck(int|string $user): void
+    {
+        $this->about('recheck', ['user' => (string) $user]);
+    }
+
+    /** `recheck()` for everyone in the room, for a rule whose answer changed for all of them. */
+    public function recheckEveryone(): void
+    {
+        $this->about('recheck', ['everyone' => true]);
+    }
+
+    /** @param array<string, mixed> $who */
+    private function about(string $action, array $who): void
+    {
+        $this->realtime->request('POST', '/wordplus/realtime/rooms/'.rawurlencode($this->room).'/'.$action, $who);
 
         try {
             $this->realtime->rotateRoom($this->room);
         } catch (\LogicException) {
-            // No generation store: the kick holds, and what the room carries next is still sealed with the key they had.
+            // No generation store: it holds, and what the room carries next is still sealed with the key they had.
         }
+    }
+
+    /** @deprecated `remove()`. */
+    public function kick(int|string $user): void
+    {
+        $this->remove($user);
     }
 }

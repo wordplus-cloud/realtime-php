@@ -53,7 +53,7 @@ final class Emitter
      * Sends the event: a sealed room's data sealed with its key, a user's with theirs, kept where a room's rule keeps
      * history. The kept events' ids, by room.
      *
-     * @param array{seal?: bool} $options
+     * @param array{seal?: bool, except?: ?string} $options
      *
      * @return array<string, string>
      *
@@ -61,6 +61,6 @@ final class Emitter
      */
     public function emit(string $event, mixed $data = null, array $options = []): array
     {
-        return $this->realtime->emitEvent(['rooms' => array_map('strval', array_keys($this->rooms)), 'users' => array_map('strval', array_keys($this->users)), 'event' => $event, 'data' => $data, 'except' => $this->skip] + $options);
+        return $this->realtime->emitEvent($options + ['rooms' => array_map('strval', array_keys($this->rooms)), 'users' => array_map('strval', array_keys($this->users)), 'event' => $event, 'data' => $data, 'except' => $this->skip]);
     }
 }

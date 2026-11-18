@@ -6,12 +6,28 @@ Three ways to show people: a presence room lists who is in it to everyone in it 
 
 ## A presence room: `routes/channels.php`
 
-```php
-// Who is in the shop, PresenceChannel( 'shop' ): everyone signed in, with their name and role.
-Broadcast::channel( 'shop', fn ( User $user ) => [ 'name' => $user->name, 'role' => $user->role ] );
+One room for the whole shop, named `shop`, and one for each room people may enter, such as `room.7`, list who is in them to everyone in them. A page that joins one asks your app first, and a rule answers: the callback of the channel whose pattern fits. WordPlus Cloud then holds the page to the answer ([permissions](https://docs.wordplus.cloud/apps/permissions/)). These rules say:
 
-// The people of a room: those who may enter, or false.
-Broadcast::channel( 'room.{room}', fn ( User $user, Room $room ) => $user->canEnter( $room ) ? [ 'name' => $user->name ] : false );
+1. **Visitors** who are not signed in stay out: a visitor never reaches the callback of a channel.
+2. **The shop** lets in everyone signed in, each shown to the others with their name and role.
+3. **A room** lets in those who may enter it, each shown with their name, and nobody else.
+
+```php
+// 2. Who is in the shop, PresenceChannel( 'shop' ): everyone signed in.
+Broadcast::channel( 'shop', function ( User $user ) {
+    // 1. A visitor never gets here.
+    return [ 'name' => $user->name, 'role' => $user->role ];
+} );
+
+// 3. The people of a room, PresenceChannel( 'room.7' ): those who may enter, and nobody else.
+Broadcast::channel( 'room.{room}', function ( User $user, Room $room ) {
+    // 1. A visitor never gets here.
+    if ( ! $user->canEnter( $room ) ) {
+        return false;
+    }
+
+    return [ 'name' => $user->name ];
+} );
 ```
 
 - **An array** lets the user in, as the member info: what the others see of them, up to 4 KB, sealed with the room key. WordPlus Cloud lists the members without reading it.
@@ -50,7 +66,7 @@ A move to another server shows nobody leaving.
 
 ## Counting
 
-`[ 'count' => true ]` gives a room a live count, without a list: `product.on( 'count', ( n ) => … )`, at most once a second. A presence room counts too.
+`[ 'count' => true ]` gives a room a live count, without a list. The page of product 7 joins `product.7`, a public room: anyone may join it, signed in or not, and no rule runs ([rooms](rooms.md)). The page hears it with `product.on( 'count', ( n ) => … )`, at most once a second. A presence room counts too.
 
 ## Who is online, across your app
 
@@ -74,6 +90,8 @@ use WordPlus\Realtime\Laravel\RealtimeServiceProvider;
 RealtimeServiceProvider::hiddenUsing( fn ( $id ) => (bool) User::find( $id )?->hide_status );
 ```
 
+`RealtimeServiceProvider::hasKeysUsing( fn ( $id ) => … )` the same way cuts a user off from the keys, such as a banned one: false gives them no keys and no identity. Everyone has them by default.
+
 ## Ready-made: who is online
 
 Optional, as every ready-made part: the presence room above is all a list needs, drawn your way ([your own interface](https://docs.wordplus.cloud/apps/interface/#who-is-in-a-room)). This is the ready-made one.
@@ -93,5 +111,12 @@ await rt.callScreen();   // loads the elements and the call screen, rt.ui() the 
 - **Only those the user may call** get a button: the list asks your calls route once for all its members, which runs your `calls()` rule for each as for the caller. Nothing to add on your server.
 - **Names and pictures** come from the member info, then from your [directory](encryption.md#your-users).
 - **Its look** is that of Better Messages, in a shadow root: your styles do not reach in, and its colours are CSS custom properties your page sets.
+
+## Use cases
+
+Each with the rules of your server and the code of the page:
+
+- [Who is online and who is here](https://docs.wordplus.cloud/use-cases/online/): a dot on every avatar, the people in a room, and a live count
+- [Editing together](https://docs.wordplus.cloud/use-cases/collaboration/): who is in a document, their cursors and their changes
 
 More, with Node and Python side by side: [presence in depth](https://docs.wordplus.cloud/apps/presence/).

@@ -10,8 +10,9 @@ $realtime->to( [ 'order:1042', 'staff' ] )->emit( 'updated', [ 'status' => 'ship
 ```
 
 - **The answer** is the kept event ids, by room, for the rooms that keep history.
-- **A refusal** throws `RealtimeError`, whose `errorCode` says why: `too_large`, `too_many`, `reserved` (event names kept for the room itself), `bad_room` ([errors](https://docs.wordplus.cloud/apps/errors/)).
+- **A refusal** throws `RealtimeError`, whose `errorCode` says why: `too_large`, `too_many`, `reserved` (one of the [reserved names](https://docs.wordplus.cloud/apps/errors/#reserved-names)), `bad_room` ([errors](https://docs.wordplus.cloud/apps/errors/)).
 - **Up to 1 MB** an event, to up to 1,000 rooms at once.
+- **Binary:** `new WordPlus\Realtime\Binary( $bytes )` anywhere in the data, sealed with the rest. A page gets it as a `Uint8Array`. A string of bytes that aren't UTF-8 can't go as it is: encoding it throws.
 
 ## Not back to the tab that made it
 
@@ -81,18 +82,40 @@ $replies = $realtime->user( 42 )->ask( 'cart', [ 'why' => 'checkout' ] );     //
 
 ## Webhooks
 
-Your server can hear what happens in rooms. Set the address on your app page in your WordPlus Cloud account (on your computer, through a tunnel: [while you develop](https://docs.wordplus.cloud/apps/sending/#while-you-develop)), `https://shop.example.com/api/realtime/webhook`, which `respond( 'webhook', … )` answers:
+Your server can hear what happens in rooms. Set the address on your app page in your WordPlus Cloud account (on your computer, through a tunnel: [while you develop](https://docs.wordplus.cloud/apps/sending/#while-you-develop)), `https://shop.example.com/api/realtime/webhook`, which `respond( 'webhook', … )` answers. The rule of a room names the events of its pages that come here too (`webhook`), and `$realtime->on()` gives each event, by its name, a handler of yours. Here:
+
+1. **The chat of two**, such as `chat:34:42`, sends its messages here too.
+2. **Each message** is kept once, by its `event_id`, from signed-in people alone.
+3. **A user going offline** is marked away.
 
 ```php
-// The rule of a room says which events of the pages come here too
+// 1. The chat of two sends its messages here too. $isOneOf is its rule, as in rooms.
 $realtime->room( 'chat:{a}:{b}', $isOneOf, [ 'history' => 50, 'emit' => [ 'message', 'typing' ], 'webhook' => [ 'message' ] ] );
 
-$realtime->on( 'message', fn ( array $e ) => save_message( $e['event_id'], $e['room'], $e['from'], $e['data']['text'], $e['at'] ) );   // a repeat has the same id
+// 2. Each message, kept once by its event_id: a repeat has the same one.
+$realtime->on( 'message', function ( array $e ) {
+    // A guest in a public room sends with no from: kept from signed-in people alone.
+    if ( ! isset( $e['from'] ) ) {
+        return;
+    }
+    save_message( $e['event_id'], $e['room'], $e['from'], $e['data']['text'], $e['at'] );
+} );
+
+// 3. A user going offline.
 $realtime->on( 'user.offline', fn ( array $e ) => mark_away( $e['user'] ) );
 ```
 
 - **What comes:** the page events a rule names in `webhook`, by their name. `room.occupied` and `room.vacated`. `member.joined` and `member.left`. `user.online` and `user.offline`. `stream.live` and `stream.ended`, a live stream going live and ending, with its name in `stream`. `call.ended`, `group.joined`, `group.left`, `stream.joined` and `stream.left`, what people used, with how long once it is over, to charge them by ([charging for calls and streams](https://docs.wordplus.cloud/use-cases/charging/)). `'*'` gets them all.
 - **Checked and opened:** each request is signed, and checked before your handler sees it. Sealed data comes opened.
 - **At least once:** each event has its id, so a repeat can be dropped. A request that fails is tried again for 24 hours.
+
+## Use cases
+
+Each with the rules of your server and the code of the page:
+
+- [Live updates and notifications](https://docs.wordplus.cloud/use-cases/live-updates/): an order moving on, and a notice to one user in every tab
+- [Every page and app of a user](https://docs.wordplus.cloud/use-cases/devices/): `ask()` and `rt.answer()`, and taking a user out of everything at once
+- [Charging for calls and streams](https://docs.wordplus.cloud/use-cases/charging/): what each person used, from the webhook
+- [Members-only streams](https://docs.wordplus.cloud/use-cases/members-only/): telling the members by `toUser()` when a stream goes live
 
 More, with Node and Python side by side: [sending in depth](https://docs.wordplus.cloud/apps/sending/).

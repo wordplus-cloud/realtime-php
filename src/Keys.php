@@ -40,7 +40,7 @@ final class Keys
     public const MAX_LABELS = 100;
 
     /** The characters of an id a label carries as they are: those of room names, but `=`, which escapes the others. */
-    private const LABEL_SAFE = '/^[A-Za-z0-9_\-@,.;:]$/';
+    private const LABEL_SAFE = '/^[A-Za-z0-9_\-@,.;:]$/D';
 
     /** @var array<string, string> */
     private array $derived = [];
@@ -49,20 +49,20 @@ final class Keys
         private readonly string $master,
         private readonly ?GenerationStore $store = null,
     ) {
-        if (1 !== preg_match('/^[0-9a-f]{64}$/', $master)) {
+        if (1 !== preg_match('/^[0-9a-f]{64}$/D', $master)) {
             throw new \InvalidArgumentException('wordplus-realtime: the local key must be 64 hex characters (openssl rand -hex 32)');
         }
     }
 
     public static function validLabel(mixed $label): bool
     {
-        return is_string($label) && strlen($label) <= 256 && 1 === preg_match('/^'.self::LABEL.'$/', $label);
+        return is_string($label) && strlen($label) <= 256 && 1 === preg_match('/^'.self::LABEL.'$/D', $label);
     }
 
     /** The label of the key that opens a sealed value, or null when it isn't one. */
     public static function labelOf(mixed $value): ?string
     {
-        return is_string($value) && 1 === preg_match('/^('.self::LABEL.'):'.self::FORMAT.'\.[A-Za-z0-9_-]+$/', $value, $m) ? $m[1] : null;
+        return is_string($value) && 1 === preg_match('/^('.self::LABEL.'):'.self::FORMAT.'\.[A-Za-z0-9_-]+$/D', $value, $m) ? $m[1] : null;
     }
 
     /** Today, in UTC days since 1970, or the day of a unix time. */
@@ -123,7 +123,7 @@ final class Keys
     /** The plain value of one this app sealed, or null: not a sealed value, another app's, or changed on the way. */
     public function open(mixed $value): ?string
     {
-        if (!is_string($value) || 1 !== preg_match('/^('.self::LABEL.'):'.self::FORMAT.'\.([A-Za-z0-9_-]+)$/', $value, $m)) {
+        if (!is_string($value) || 1 !== preg_match('/^('.self::LABEL.'):'.self::FORMAT.'\.([A-Za-z0-9_-]+)$/D', $value, $m)) {
             return null;
         }
 
@@ -235,14 +235,21 @@ final class Keys
      * A user's entry in the directory: `pd`, the profile with every text sealed with the day's key however deep (numbers,
      * true and false as they are), and `pdh`, an HMAC of the plain profile under a key derived from the local key.
      *
+     * Where the profile is sealed, the hash's last 8 digits are the day, as WordPress has the day in its hash (wordplus/
+     * realtime 64ca239). So a page of a new day sends a new hash, the server takes its fresh entry, and the entry it keeps
+     * stays within the day keys a page holds. Its first 56 digits say the profile alone, which @wordplus/realtime's
+     * RealtimeProvider reads, so a new day doesn't connect a page again.
+     *
      * @param array<string, mixed> $plain
+     * @param int|null             $day   the day it is sealed for, today unless named
      *
      * @return array{pd: array<string, mixed>, pdh: string}
      */
-    public function profile(int|string $user, array $plain, bool $seal = true): array
+    public function profile(int|string $user, array $plain, bool $seal = true, ?int $day = null): array
     {
         $plain['user_id'] = $user;
-        $label = $this->dayLabel();
+        $day ??= self::day();
+        $label = $this->dayLabel($day);
         $pd = [];
 
         foreach ($plain as $field => $value) {
@@ -260,7 +267,9 @@ final class Keys
             }
         }
 
-        return ['pd' => $pd, 'pdh' => hash_hmac('sha256', Json::encode($plain), $this->key('profile-hash'))];
+        $hash = hash_hmac('sha256', Json::encode($plain), $this->key('profile-hash'));
+
+        return ['pd' => $pd, 'pdh' => $seal ? substr($hash, 0, 56).sprintf('%08x', $day) : $hash];
     }
 
     private function sealedValue(mixed $value, string $label, bool $seal, int $depth): mixed

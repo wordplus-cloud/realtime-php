@@ -57,9 +57,21 @@ Calls, and rooms of your own beside routes/channels.php, in a service provider's
 use WordPlus\Realtime\Realtime;
 
 $this->callAfterResolving( Realtime::class, function ( Realtime $realtime ) {
-    $realtime->calls( 'support:{a}:{b}', fn ( $user, $with, array $p ) => User::find( $user )?->can( 'call', $with ) );
     $realtime->room( 'staff', fn ( $user ) => (bool) User::find( $user )?->is_staff, [ 'presence' => true ] );
 } );
+```
+
+Who may call whom is your app's own logic, so it lives in a route of your own, which answers a token for the page's `rt.startCall( token )`. Group calls and live streams work the same way, with `Realtime::groupCallToken()` and `Realtime::streamToken()`.
+
+```php
+Route::get( '/api/call-token', function ( Request $request ) {
+    $me = $request->user()->id;
+    $to = $request->query( 'to' );
+
+    abort_unless( $request->user()->can( 'call', $to ), 403 );
+
+    return [ 'token' => Realtime::callToken( $me, $to ) ];
+} )->middleware( 'auth' );
 ```
 
 The routes are `POST /wordplus/realtime/auth`, `/calls` and `/keys` on the `web` middleware, which give the session's user, and `/webhook`, which the realtime server signs. A user's name (and `avatar`, or Jetstream's `profile_photo_url`) is what the others see. `RealtimeServiceProvider::profileUsing( fn ( $id ) => [ 'name' => …, 'avatar' => … ] )` says otherwise, and `hiddenUsing()` who is never shown online. `php artisan vendor:publish --tag=wordplus-realtime` copies the config.

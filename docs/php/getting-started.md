@@ -15,7 +15,7 @@ PHP can run websockets with a server of its own. [Why WordPlus Cloud](https://do
 
 ## 1. Your app in WordPlus Cloud
 
-**Apps are in early access.** Ask for it on our [contact form](https://www.wordplus.cloud/contact), and we turn **Apps** on in your WordPlus Cloud account. Until then your account has no Apps page.
+**Apps come with a subscription.** [Choose your connections](https://www.wordplus.cloud/pricing#apps), starting from 1,000, and your WordPlus Cloud account gets its **Apps** page.
 
 In your WordPlus Cloud account, go to **Apps → Add app**. Name it, and list the addresses its pages are served from: `https://shop.example.com`, and `http://localhost:8000` while you develop. Only pages on those addresses may connect.
 
@@ -27,6 +27,8 @@ WORDPLUS_SECRET=…
 WORDPLUS_LOCAL_KEY=…        # openssl rand -hex 32; the same on every server of the app, kept as long as the app
 ```
 
+Once the package is installed, its command writes these for you, with a local key it makes, and says whether your keys and routes work: `vendor/bin/wordplus-realtime init`, then `vendor/bin/wordplus-realtime check http://localhost:8000`.
+
 ## 2. Install
 
 ```bash
@@ -37,6 +39,13 @@ That is all, with no Node: the package carries the browser files, and your route
 
 ## 3. Your server
 
+Each room is named after what it carries: `order:1042` for the updates of order 1042. A page that joins it asks your server first, and a rule answers: a function your server declares once for every room whose name fits the pattern `order:{id}`. WordPlus Cloud then holds the page to the answer ([permissions](https://docs.wordplus.cloud/apps/permissions/)). This rule says:
+
+1. **Visitors** who are not signed in stay out.
+2. **The customer of the order** joins, and nobody else.
+
+And the room keeps its last 20 updates, for a page that reconnects.
+
 ```php
 // src/realtime.php, required by every request that needs it
 use WordPlus\Realtime\Realtime;
@@ -46,8 +55,16 @@ $realtime = Realtime::fromEnvironment( [   // WORDPLUS_SITE, WORDPLUS_SECRET, WO
     'profile' => fn ( $user ) => ( $u = find_user( $user ) ) ? [ 'name' => $u->name, 'avatar' => $u->avatar_url ] : null,
 ] );
 
-// The room of an order: its customer may join, and the last 20 updates are kept.
-$realtime->room( 'order:{id}', fn ( $user, array $p ) => null !== $user && order_owner( $p['id'] ) === $user, [ 'history' => 20 ] );
+// The room of an order, order:1042, the last 20 updates kept.
+$realtime->room( 'order:{id}', function ( $user, array $p ) {
+    // 1. Visitors stay out.
+    if ( null === $user ) {
+        return false;
+    }
+
+    // 2. The customer of the order, and nobody else.
+    return order_owner( $p['id'] ) === $user;
+}, [ 'history' => 20 ] );
 ```
 
 ```php
@@ -106,9 +123,13 @@ Everyone in the room gets `{ status }`, sealed with the room key on the way, and
 
 ## Next
 
-- [Rooms](rooms.md), [presence and who is online](presence.md), [sending from your server](sending.md) and [events from the page](events.md), with the ready-made chat
-- [Calls and group calls](calls.md), with the call screen
+- [Rooms](rooms.md), [presence and who is online](presence.md), [sending from your server](sending.md) and [events from the page](events.md), with the ready-made conversation window (`<chat-room>`)
+- [Calls and group calls](calls.md), with the call screen, and [live streams](streams.md)
 - [Encryption and your users](encryption.md)
 - [Customizing the screens](customizing.md): their look, a piece of your own, or their whole code
 - [Deploying](deploying.md), and [the example app](example.md)
 - The [PHP reference](../reference.md), the [browser reference](https://docs.wordplus.cloud/apps/browser/), [errors](https://docs.wordplus.cloud/apps/errors/) and [limits](https://docs.wordplus.cloud/apps/limits/)
+
+## What to build next
+
+Each use case is a page of its own, with the rules of your server and the code of the page: [chat](https://docs.wordplus.cloud/use-cases/chat/), [who is online](https://docs.wordplus.cloud/use-cases/online/), [live updates and notifications](https://docs.wordplus.cloud/use-cases/live-updates/), [calls from a button](https://docs.wordplus.cloud/use-cases/support-calls/), [team meetings](https://docs.wordplus.cloud/use-cases/meetings/), [live streaming](https://docs.wordplus.cloud/use-cases/live-streaming/) and the rest in the [use cases](https://docs.wordplus.cloud/use-cases/overview/). Three of them build a small Node.js app from an empty folder, every file in full.

@@ -256,45 +256,9 @@ $realtime->room('webhooks', fn ($user) => 0 === (person($user)['shop'] ?? null),
 $realtime->room('webhooks:{s}', fn ($user, array $p) => (int) $p['s'] === (person($user)['shop'] ?? null), ['history' => 20]);
 // #endregion
 
-// #region demo: members
-// Calls between two people, support:34:42: the two it names, one of them staff. Either of them may bring more staff in,
-// and the call goes on as a group call: the one adding calls the staff member about it, who takes the call from them.
-$realtime->calls('support:{a}:{b}', function ($user, $with, array $p) {
-    $pair = [(int) $p['a'], (int) $p['b']];
-    if (!same_shop($user, $with, ...$pair)) {
-        return false;
-    }
-
-    if (in_array($user, $pair, true) && in_array($with, $pair, true)) {
-        return is_staff($user) || is_staff($with);
-    }
-
-    return (in_array($user, $pair, true) && is_staff($with)) || (is_staff($user) && in_array($with, $pair, true));
-}, [
-    // Whom the call screen offers to add: the shop staff not in the call.
-    'people' => fn ($user, string $call) => array_values(array_map(fn (array $p) => $p['id'], array_filter(
-        people_of(shop_of($user)),
-        fn (array $p) => $p['staff'] && !in_array($p['id'], array_map('intval', array_slice(explode(':', $call), 1)), true),
-    ))),
-]);
-// #endregion
-
-// #region demo: meeting
-// The daily meeting: a group call for everyone in the shop.
-$realtime->groupCalls('meeting:{id}', fn ($user, array $p) => (person($user)['shop'] ?? null) === ('daily' === $p['id'] ? 0 : (int) $p['id']));
-// #endregion
-
-// #region demo: show
-// The shop live show, show:mugs: Ann presents it, and everyone else watches and writes in its chat, signed in or not.
-$realtime->streams('show:{id}', function ($user, array $p) {
-    $s = shop_of_room('show:'.$p['id']);
-    if (null === $s || !isset(shops()[(string) $s])) {
-        return false;
-    }
-
-    return $s === (person($user)['shop'] ?? null) && 'Ann' === person($user)['name'] ? 'host' : 'viewer';
-}, ['reactions' => true]);
-// #endregion
+// Calls, the daily meeting and the live show start from tokens of this app's own routes (public/index.php): GET
+// /api/call-token, /api/meeting-token and /api/show-token, each its own check, then $realtime->callToken(),
+// groupCallToken() or streamToken().
 
 // #region demo: webhooks
 // What WordPlus Cloud tells this server by webhook (set https://<your server>/api/realtime/webhook on your app page in

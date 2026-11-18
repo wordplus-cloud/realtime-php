@@ -3,7 +3,7 @@
 return [
     // The app's key and secret, from the WordPlus Cloud account (Apps), and a key of the app's own that never leaves its
     // servers: openssl rand -hex 32.
-    'site' => env('WORDPLUS_SITE'),
+    'app' => env('WORDPLUS_SITE'),
     'secret' => env('WORDPLUS_SECRET'),
     'local_key' => env('WORDPLUS_LOCAL_KEY'),
 
@@ -26,6 +26,14 @@ return [
     'files' => true,
     'worker' => null,
     'rooms' => null,
+    'rooms_worker' => null,
+
+    // Headers each request of the browser to the routes carries, beside the CSRF token @wordplusRealtime sends.
+    'headers' => [],
+
+    // How long the tokens the routes sign last, in seconds: 21,600 (6 hours) by default for both.
+    'token_ttl' => null,
+    'call_token_ttl' => null,
 
     // Where the keys' generations are kept, for rotateRoom() and rotateUser(), and kick(): a cache store that doesn't
     // evict (database, redis), or null for none.

@@ -32,11 +32,19 @@ if (demo()) {
 session_start(['read_and_close' => !in_array($path, ['/login', '/logout'], true)]);
 $me = person($_SESSION['user'] ?? null);
 
-// On a demo, a window may be someone else: its address names their token, and its requests carry it as a bearer.
+// A new visitor of a demo opening its start page gets their shop there and then, with no redirect to /login and back,
+// which a search engine, keeping no cookie, would follow without end.
+if (demo() && null === $me && '/' === $path && 'GET' === $method) {
+    $me = person(demo_start());
+}
+
+// On a demo, a window may be someone else: its address names their token, and its requests carry it as a bearer. No
+// search engine keeps a window (noindex): each new shop has new tokens, so it would find new addresses without end.
 if (demo()) {
     if (preg_match('#^/as/([\w.-]+)$#', $path, $as) && 'GET' === $method) {
         $path = '/';
         $me = person(demo_user_of($as[1])) ?? $me;
+        header('X-Robots-Tag: noindex, nofollow');
     } elseif (null !== ($bearer = demo_user_of(preg_replace('/^Bearer /', '', $_SERVER['HTTP_AUTHORIZATION'] ?? '')))) {
         $me = person($bearer);
     }
@@ -79,12 +87,7 @@ if (preg_match('#^/api/realtime/(auth|calls|keys|webhook)$#', $path, $route)) {
 if ('/login' === $path) {
     // A new visitor of a demo: a shop of their own, and they are its Ann.
     if (demo()) {
-        // The visitor address as the proxy in front saw it: the last of X-Forwarded-For, the one it added. The
-        // ones before it are whatever the visitor sent.
-        $forwarded = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR'] ?? '');
-        $s = demo_open_shop(trim(end($forwarded)) ?: ($_SERVER['REMOTE_ADDR'] ?? 'local'));
-        session_regenerate_id(true);
-        $_SESSION['user'] = $s * 100 + 34;
+        demo_start();
         header('Location: /', true, 303);
         exit;
     }
@@ -103,6 +106,54 @@ if ('/logout' === $path && 'POST' === $method) {
     header('Location: /login', true, 303);
     exit;
 }
+
+// #region demo: members
+// GET /api/call-token?to=34&type=video: a call between two people of a shop, asked by <call-button> and <online-list> as a
+// call button is pressed. The app's own check, then the token that lets this user call that one.
+if ('/api/call-token' === $path && 'GET' === $method) {
+    $to = (int) ($_GET['to'] ?? 0);
+
+    // Two people of the same shop, one of them staff: customers never call each other.
+    if (null === $me || null === person($to) || $me['id'] === $to || !same_shop($me['id'], $to) || (!$me['staff'] && !is_staff($to))) {
+        answer(['error' => 'forbidden'], 403);
+    }
+
+    answer(['token' => $realtime->callToken($me['id'], $to, ['type' => $_GET['type'] ?? null])]);
+}
+// #endregion
+
+// #region demo: meeting
+// GET /api/meeting-token?id=daily: the daily meeting of a shop, a group call, asked by <group-call-button> as it is
+// pressed. The name comes from the id: meeting:daily for the shop of the guides, meeting:7 for a demo shop.
+if ('/api/meeting-token' === $path && 'GET' === $method) {
+    $id = (string) ($_GET['id'] ?? '');
+
+    // Everyone in the shop, and nobody else.
+    if (null === $me || $me['shop'] !== ('daily' === $id ? 0 : (ctype_digit($id) ? (int) $id : null))) {
+        answer(['error' => 'forbidden'], 403);
+    }
+
+    answer(['token' => $realtime->groupCallToken($me['id'], 'meeting:'.$id)]);
+}
+// #endregion
+
+// #region demo: show
+// GET /api/show-token?id=mugs: the live show of a shop, asked by <live-stream>, again as each ten-minute token runs out.
+// The name comes from the id: show:mugs for the shop of the guides, show:7 for a demo shop.
+if ('/api/show-token' === $path && 'GET' === $method) {
+    $name = 'show:'.(string) ($_GET['id'] ?? '');
+
+    // 1. A show of a shop here: any other is refused.
+    $s = shop_of_room($name);
+    if (null === $s || !isset(shops()[(string) $s])) {
+        answer(['error' => 'forbidden'], 403);
+    }
+
+    // 2. Ann of the shop presents it, and everyone else watches and writes in its chat, signed in or not.
+    $host = null !== $me && $s === $me['shop'] && 'Ann' === $me['name'];
+    answer(['token' => $realtime->streamToken($me['id'] ?? null, $name, ($host ? ['role' => 'host'] : []) + ['settings' => ['reactions' => true]])]);
+}
+// #endregion
 
 if (null === $me) {
     'GET' === $method ? header('Location: /login', true, 303) : answer(['error' => 'sign_in'], 401);
@@ -161,7 +212,15 @@ if ('/' === $path) {
         'order' => $order,
         'chat' => ['between' => [$me['shop'] * 100 + 34, $me['shop'] * 100 + 42]],
         'product' => ['name' => 'Two ceramic mugs', 'picture' => '/products/mugs.webp'],
-        'routes' => ['status' => '/orders/'.$order['id'].'/status', 'wire' => '/orders/'.$order['id'].'/wire', 'messages' => '/chat/messages'],
+        'routes' => [
+            'status' => '/orders/'.$order['id'].'/status',
+            'wire' => '/orders/'.$order['id'].'/wire',
+            'messages' => '/chat/messages',
+            // The routes that start a call, the meeting and the show, each with the id of the shop's own.
+            'callToken' => '/api/call-token',
+            'meetingToken' => '/api/meeting-token?id='.explode(':', rooms_of($me['shop'])['meeting'], 2)[1],
+            'showToken' => '/api/show-token?id='.explode(':', rooms_of($me['shop'])['show'], 2)[1],
+        ],
         'rooms' => rooms_of($me['shop']),
         'events' => ['order' => 'updated', 'chat' => 'message'],
         'headers' => new stdClass(),

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace WordPlus\Realtime\Tests;
 
 use PHPUnit\Framework\TestCase;
+use WordPlus\Realtime\Binary;
 use WordPlus\Realtime\GenerationStore;
 use WordPlus\Realtime\Keys;
 use WordPlus\Realtime\Patterns;
@@ -153,6 +154,28 @@ final class RealtimeTest extends TestCase
         $p->add('bad pattern', 'x');
     }
 
+    /** PCRE's $ also matches before a newline at the end, so these went to the rule, as Node's answer `bad_room` shows they mustn't. */
+    public function test_a_name_with_a_newline_at_its_end_is_refused_as_node_refuses_it()
+    {
+        $realtime = $this->app();
+        $asked = [];
+        $realtime->room('order:{id}', static function ($user, array $p) use (&$asked) {
+            $asked[] = $p['id'];
+
+            return true;
+        });
+        $realtime->calls('support:{a}:{b}', static fn () => true);
+
+        $this->assertFalse(Patterns::validRoom("order:42\n"));
+        $this->assertFalse(Patterns::validPattern("order:{id}\n"));
+        $this->assertFalse(Keys::validLabel("d:1\n"));
+        $this->assertEquals((object) ["order:42\n" => 'bad_room'], $realtime->authorize(["order:42\n"], 42)['denied']);
+        $this->assertSame([], $asked);
+
+        $this->assertSame(['denied' => 'bad_request'], $realtime->authorizeCall(['call' => 'support:42:34', 'id' => "abcdefgh\n", 'role' => 'caller', 'to' => 34], 42));
+        $this->assertSame(['denied' => 'bad_request'], $realtime->authorizeCall(['call' => 'support:42:34', 'id' => 'abcdefgh', 'role' => 'caller', 'to' => "34\n"], 42));
+    }
+
     public function test_the_auth_route_signs_one_token_for_the_rooms_allowed_with_their_options_and_keys()
     {
         $realtime = $this->app();
@@ -184,6 +207,16 @@ final class RealtimeTest extends TestCase
         $this->assertSame('{"denied":{}}', json_encode($realtime->authorize([], 7)));
         $this->assertStringContainsString('"r":{"news":{"c":1}}', (string) base64_decode(strtr(explode('.', $realtime->authorize(['news'], 7)['token'])[1], '-_', '+/')));
         $this->assertStringContainsString('"r":{"order:42":{"h":[20,' . json_encode(\WordPlus\Realtime\Realtime::MAX_HISTORY_DAYS) . ']}}', (string) base64_decode(strtr(explode('.', $realtime->authorize(['order:42'], 42)['token'])[1], '-_', '+/')));
+    }
+
+    public function test_a_rooms_history_takes_any_number_rounded_down_as_node_does()
+    {
+        $realtime = $this->app();
+        $realtime->room('a:{id}', static fn () => true, ['history' => 20.9]);
+        $realtime->room('b:{id}', static fn () => true, ['history' => 20.0]);
+
+        $claims = $this->claims($realtime->authorize(['a:1', 'b:1'], 42)['token'], 'wordplus-realtime channels v1');
+        $this->assertSame([20, 20], [$claims['r']['a:1']['h'][0], $claims['r']['b:1']['h'][0]]);
     }
 
     public function test_a_rooms_history_keeps_a_part_of_a_day_and_the_cloud_limit_when_days_is_missing_or_not_above_0()
@@ -222,6 +255,314 @@ final class RealtimeTest extends TestCase
         $this->assertSame(['name' => 'User 7', 'avatar' => 'https://example.com/7.png'], $plain['info']);
         $this->assertArrayNotHasKey('infos', $plain);
         $this->assertArrayNotHasKey('keys', $realtime->authorize(['lobby'], 7));
+    }
+
+    public function test_patterns_take_pair_as_the_two_people_a_name_holds_weighing_what_a_b_weighs()
+    {
+        $p = new Patterns();
+        $p->add('chat:{pair}', 'pair');
+        $p->add('chat:{a}:{b}', 'parts');
+        $p->add('chat:{id}', 'one');
+
+        $this->assertSame(['pattern' => 'chat:{pair}', 'value' => 'pair', 'params' => ['pair' => '34:42']], $p->match('chat:34:42'));
+        $this->assertSame('one', $p->match('chat:7')['value']);
+        $this->assertNull($p->match('chat:34:42:56'));
+
+        $this->expectExceptionMessageMatches('/one pair/');
+        $p->add('x:{pair}:{pair}', 'x');
+    }
+
+    public function test_a_room_of_pair_lets_in_the_two_people_its_name_holds_with_no_rule_and_nobody_else()
+    {
+        $realtime = $this->app();
+        $this->assertSame($realtime, $realtime->room('chat:{pair}', null, ['history' => 50, 'emit' => ['message']]));
+
+        $this->assertTrue($realtime->mayJoin('chat:34:42', 34));
+        $this->assertTrue($realtime->mayJoin('chat:34:42', '42'));
+        $this->assertFalse($realtime->mayJoin('chat:34:42', 7));
+        $this->assertFalse($realtime->mayJoin('chat:34:42', null));
+        $this->assertFalse($realtime->mayJoin('chat:42:42', 42));
+
+        $grant = $realtime->authorize(['chat:34:42'], 42);
+        $this->assertSame(['message'], $this->claims($grant['token'], 'wordplus-realtime channels v1')['r']['chat:34:42']['e']);
+
+        $this->assertSame($realtime, $realtime->room('dm:{pair}'));
+        $this->assertTrue($realtime->mayJoin('dm:user_2abc:user_9xyz', 'user_9xyz'));
+    }
+
+    public function test_a_room_of_pair_asks_the_apps_rule_only_about_the_two_told_who_the_other_is()
+    {
+        $asked = [];
+        $realtime = $this->app()->room('chat:{pair}', static function ($user, array $params, string $room) use (&$asked) {
+            $asked[] = [$user, $params, $room];
+
+            return '34' !== $params['other'];
+        });
+
+        $this->assertFalse($realtime->mayJoin('chat:34:42', 7));
+        $this->assertSame([], $asked);
+
+        $this->assertFalse($realtime->mayJoin('chat:34:42', 42));
+        $this->assertSame([[42, ['pair' => '34:42', 'other' => '34'], 'chat:34:42']], $asked);
+        $this->assertTrue($realtime->mayJoin('chat:34:42', 34));
+    }
+
+    /** @return array<string, mixed> what a call token holds */
+    private function madeCall(string $token): array
+    {
+        return json_decode((string) base64_decode(strtr($token, '-_', '+/')), true);
+    }
+
+    public function test_a_call_token_signs_the_call_keeping_from_the_realtime_server_what_is_the_pages_alone()
+    {
+        $realtime = $this->app();
+        $made = $this->madeCall($realtime->callToken(42, 34));
+        $claims = $this->claims($made['token'], 'wordplus-realtime calls v1');
+
+        $this->assertSame('wordplus-realtime call', $claims['aud']);
+        $this->assertSame('call:'.$made['id'], $claims['call']);
+        $this->assertSame([$made['id'], 42, 'caller', 'video', 34], [$claims['id'], $claims['sub'], $claims['role'], $claims['type'], $claims['to']]);
+        $this->assertSame([42, 34], $made['pair']);
+        $this->assertSame($realtime->callKey($made['id'], 42, 34), $made['key']);
+
+        $seen = (string) json_encode($claims);
+
+        foreach ([$made['key'], $made['media_key'], $made['member'], '_ring', 'User 42'] as $secret) {
+            $this->assertStringNotContainsString($secret, $seen);
+        }
+    }
+
+    public function test_a_call_token_takes_a_type_a_name_and_what_the_person_called_is_told()
+    {
+        $made = $this->madeCall($this->app(['seal' => false])->callToken('user_2abc', 34, ['type' => 'audio', 'name' => 'support:17', 'info' => ['name' => 'Ann']]));
+        $claims = $this->claims($made['token'], 'wordplus-realtime calls v1');
+
+        $this->assertSame(['support:17', 'user_2abc', 'audio', 'Ann'], [$claims['call'], $claims['sub'], $claims['type'], $claims['info']['name']]);
+        $this->assertIsString($claims['info']['_ring']);
+    }
+
+    public function test_the_person_rung_answers_a_call_token_with_its_proof_and_no_rule_and_nobody_else_does()
+    {
+        $realtime = $this->app(['seal' => false]);
+        $made = $this->madeCall($realtime->callToken(42, 34));
+        $ring = $this->claims($made['token'], 'wordplus-realtime calls v1')['info']['_ring'];
+        $answering = ['call' => $made['call'], 'id' => $made['id'], 'role' => 'callee', 'type' => 'video'];
+
+        $answer = $realtime->authorizeCall($answering + ['from' => 42, 'ring' => $ring], 34);
+        $this->assertSame([34, 'callee'], [$this->claims($answer['token'], 'wordplus-realtime calls v1')['sub'], $this->claims($answer['token'], 'wordplus-realtime calls v1')['role']]);
+        $this->assertSame([$made['key'], $made['media_key'], [42, 34]], [$answer['key'], $answer['media_key'], $answer['pair']]);
+
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall($answering + ['from' => 42, 'ring' => str_repeat('A', 43)], 34));
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall($answering + ['from' => 42, 'ring' => $ring], 56));
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall($answering + ['from' => 56, 'ring' => $ring], 34));
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall($answering + ['from' => 42], 34));
+    }
+
+    public function test_a_call_token_is_the_only_way_to_start_a_call_with_no_rule_and_its_proof_renews_it_for_its_holder_alone()
+    {
+        $realtime = $this->app();
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['call' => 'call:anything', 'id' => 'abcDEF123_-xyz', 'role' => 'caller', 'to' => 56, 'type' => 'video'], 42));
+
+        $made = $this->madeCall($realtime->callToken(42, 34));
+        $renewing = ['call' => $made['call'], 'id' => $made['id'], 'role' => 'caller', 'to' => 34, 'type' => 'video', 'member' => $made['member']];
+
+        $this->assertSame($made['media_key'], $realtime->authorizeCall($renewing, 42)['media_key']);
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall($renewing, 56));
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['to' => 56] + $renewing, 42));
+
+        // Being in a call brings nobody new into it.
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['call' => $made['call'], 'id' => 'anotherAttempt1', 'role' => 'caller', 'to' => 56, 'type' => 'video', 'group' => $made['id'], 'pair' => $made['pair'], 'member' => $made['member']], 42));
+    }
+
+    public function test_a_call_token_refuses_what_cant_be_a_call()
+    {
+        $realtime = $this->app();
+
+        foreach ([[42, 42, []], [42, 'has a space', []], [42, 34, ['name' => 'has a space']]] as [$user, $to, $options]) {
+            try {
+                $realtime->callToken($user, $to, $options);
+                $this->fail('It made a token for that.');
+            } catch (\InvalidArgumentException $e) {
+                $this->assertStringContainsString('wordplus-realtime', $e->getMessage());
+            }
+        }
+    }
+
+    /** @param array<string, mixed> $made */
+    private function callRef(array $made, ?string $member = null): string
+    {
+        return Keys::base64url((string) json_encode(['id' => $made['id'], 'name' => $made['call'], 'type' => $made['type'], 'pair' => $made['pair'], 'member' => $member ?? $made['member']]));
+    }
+
+    public function test_a_call_token_with_into_rings_someone_into_a_call_of_this_user_and_they_answer_with_its_proof()
+    {
+        $realtime = $this->app();
+        $first = $this->madeCall($realtime->callToken(42, 34, ['type' => 'audio']));
+        $made = $this->madeCall($realtime->callToken(42, 56, ['into' => $this->callRef($first)]));
+        $claims = $this->claims($made['token'], 'wordplus-realtime calls v1');
+
+        $this->assertSame([$first['call'], 42, 'caller', 56, 'audio', $first['id']], [$claims['call'], $claims['sub'], $claims['role'], $claims['to'], $claims['type'], $claims['group']]);
+        $this->assertSame([42, 34], $made['pair']);
+        $this->assertNotSame($first['id'], $made['id']);
+
+        $answer = $realtime->authorizeCall(['call' => $first['call'], 'id' => $made['id'], 'role' => 'callee', 'from' => 42, 'type' => 'audio', 'group' => $first['id'], 'pair' => [42, 34], 'ring' => $made['ring']], 56);
+        $this->assertSame(56, $this->claims($answer['token'], 'wordplus-realtime calls v1')['sub']);
+        $this->assertSame($first['media_key'], $answer['media_key']);
+    }
+
+    public function test_a_call_token_with_into_refuses_someone_not_in_the_call()
+    {
+        $realtime = $this->app();
+        $first = $this->madeCall($realtime->callToken(42, 34));
+
+        foreach ([[77, $this->callRef($first)], [42, $this->callRef($first, str_repeat('A', 43))], [42, 'nothing']] as [$user, $into]) {
+            try {
+                $realtime->callToken($user, 56, ['into' => $into]);
+                $this->fail('It made a token for that.');
+            } catch (\InvalidArgumentException $e) {
+                $this->assertStringContainsString('a call this user is in', $e->getMessage());
+            }
+        }
+    }
+
+    public function test_a_group_call_token_signs_a_place_in_the_call_as_asked_with_no_rule()
+    {
+        $realtime = $this->app();
+        $made = $this->madeCall($realtime->groupCallToken(42, 'class:7', ['type' => 'audio', 'publish' => false, 'hidden' => true]));
+        $claims = $this->claims($made['token'], 'wordplus-realtime calls v1');
+
+        $this->assertSame(['wordplus-realtime room', 'class:7', 42, 'audio', false, true, false, true], [$claims['aud'], $claims['room'], $claims['sub'], $claims['type'], $claims['publish'], $claims['subscribe'], $claims['admin'], $claims['hidden']]);
+        $this->assertSame(['class:7', 42], [$made['room'], $made['user']]);
+        $this->assertArrayNotHasKey('media_key', $made);
+        $this->assertArrayNotHasKey('host', $made);
+        $this->assertArrayNotHasKey('recorder', $made);
+
+        // Encrypted, everyone gets the same key, which the realtime server never sees.
+        $ann = $this->madeCall($realtime->groupCallToken(42, 'meeting:7', ['encrypt' => true]));
+        $this->assertSame($ann['media_key'], $this->madeCall($realtime->groupCallToken(34, 'meeting:7', ['encrypt' => true]))['media_key']);
+        $this->assertStringNotContainsString($ann['media_key'], (string) json_encode($this->claims($ann['token'], 'wordplus-realtime calls v1')));
+
+        // Nobody goes around the app through the SDK's own route.
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['room' => 'class:7', 'type' => 'video'], 42));
+    }
+
+    public function test_a_group_call_tokens_host_acts_through_the_sdks_route_with_its_proof_and_nobody_else()
+    {
+        // Held: no recorder proof while recording is unavailable, whoever asks; the rest of this test has the switch on.
+        $held = $this->app();
+        $this->assertArrayNotHasKey('recorder', $this->madeCall($held->groupCallToken(42, 'class:7', ['admin' => true])));
+        $this->assertArrayNotHasKey('recorder', $this->madeCall($held->groupCallToken(34, 'class:7', ['record' => true])));
+        Realtime::$recordingAvailable = true;
+        try {
+            $this->groupCallTokenHostActs();
+        } finally {
+            Realtime::$recordingAvailable = false;
+        }
+    }
+
+    private function groupCallTokenHostActs(): void
+    {
+        $realtime = $this->app([], static fn () => ['ok' => true, 'muted' => true, 'recording' => ['id' => 'rec123456', 'state' => 'recording'], 'id' => 'rec123456', 'state' => 'recording']);
+        $host = $this->madeCall($realtime->groupCallToken(42, 'class:7', ['admin' => true]));
+        $ask = ['moderate' => 'class:7', 'act' => 'mute', 'user' => 34];
+
+        $this->assertSame(['done' => true], $realtime->authorizeCall($ask + ['host' => $host['host']], 42));
+
+        $before = count($this->sent);
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['user' => 42] + $ask + ['host' => $host['host']], 34));
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['moderate' => 'class:8'] + $ask + ['host' => $host['host']], 42));
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall($ask + ['host' => ['until' => $host['host']['until'], 'proof' => str_repeat('A', 43)]], 42));
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall($ask, 42));
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall($ask + ['host' => ['until' => 1000, 'proof' => $host['host']['proof']]], 42));
+        $this->assertCount($before, $this->sent);
+
+        // Recording, with a host's proof, or when told.
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['call' => 'class:7', 'record' => 'start'], 42));
+        $this->assertArrayHasKey('recording', $realtime->authorizeCall(['call' => 'class:7', 'record' => 'start', 'recorder' => $host['recorder']], 42));
+        $this->assertArrayNotHasKey('recorder', $this->madeCall($realtime->groupCallToken(42, 'class:7', ['admin' => true, 'record' => false])));
+        $this->assertArrayHasKey('recorder', $this->madeCall($realtime->groupCallToken(34, 'class:7', ['record' => true])));
+
+        // A rule that owns the name decides, whatever proof a page holds.
+        $realtime->groupCalls('class:{id}', static fn () => true);
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall($ask + ['host' => $host['host']], 42));
+    }
+
+    public function test_a_stream_token_signs_who_they_are_as_asked_with_no_rule_and_a_visitor_can_only_watch()
+    {
+        $realtime = $this->app();
+        $grant = static fn (string $token) => json_decode((string) base64_decode(strtr(explode('.', json_decode((string) base64_decode(strtr($token, '-_', '+/')), true)['token'])[1], '-_', '+/')), true);
+
+        $host = $grant($realtime->streamToken(42, 'show:7', ['role' => 'host', 'src' => ['camera'], 'quality' => '720p', 'settings' => ['reactions' => true, 'people' => 'all', 'stage' => false, 'chat' => ['offline' => 'closed', 'links' => false, 'fresh' => true]]]));
+        $this->assertSame(['show:7', 'host', '42', 'User 42', ['camera'], '720p', true, 'all', false, 'closed', false, true], [$host['str'], $host['role'], $host['sub'], $host['name'], $host['src'], $host['q'], $host['reactions'], $host['people'], $host['stage'], $host['offline'], $host['links'], $host['fresh']]);
+        $this->assertSame(600, $host['exp'] - $host['iat']);
+
+        $this->assertSame(['viewer', '42'], [$grant($realtime->streamToken(42, 'show:7'))['role'], $grant($realtime->streamToken(42, 'show:7'))['sub']]);
+        $this->assertSame('viewer', $grant($realtime->streamToken(null, 'show:7'))['role']);
+        $this->assertArrayNotHasKey('sub', $grant($realtime->streamToken(null, 'show:7')));
+        $this->assertTrue($grant($realtime->streamToken(42, 'show:7', ['mod' => true]))['mod']);
+
+        foreach ([[null, 'show:7', ['role' => 'host']], [42, 'has_underscore', []]] as [$user, $name, $options]) {
+            try {
+                $realtime->streamToken($user, $name, $options);
+                $this->fail('It made a token for that.');
+            } catch (\InvalidArgumentException $e) {
+                $this->assertStringContainsString('wordplus-realtime', $e->getMessage());
+            }
+        }
+
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['stream' => 'show:7'], 42));
+    }
+
+    public function test_a_call_of_pair_lets_the_two_call_each_other_with_no_rule_and_nobody_else()
+    {
+        $realtime = $this->app();
+        $this->assertSame($realtime, $realtime->calls('support:{pair}'));
+        $ask = static fn ($to) => ['call' => 'support:34:42', 'id' => 'abcDEF123_-xyz', 'role' => 'caller', 'to' => $to, 'type' => 'video'];
+
+        $this->assertArrayHasKey('token', $realtime->authorizeCall($ask(34), 42));
+        $this->assertArrayHasKey('token', $realtime->authorizeCall($ask(42), 34));
+        $this->assertArrayHasKey('token', $realtime->authorizeCall(['call' => 'support:34:42', 'id' => 'abcDEF123_-xyz', 'role' => 'callee', 'from' => 34], 42));
+
+        // Someone else calling either of them, and either of them calling someone else, as a third person added would.
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall($ask(34), 7));
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall($ask(7), 42));
+    }
+
+    public function test_a_call_of_pair_asks_the_apps_rule_only_about_the_two()
+    {
+        $asked = [];
+        $realtime = $this->app()->calls('support:{pair}', static function ($user, $withUser, array $params, string $call, array $side) use (&$asked) {
+            $asked[] = [$user, $withUser, $params, $call, $side];
+
+            return 42 === $user;
+        });
+        $ask = static fn ($to) => ['call' => 'support:34:42', 'id' => 'abcDEF123_-xyz', 'role' => 'caller', 'to' => $to, 'type' => 'video'];
+
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall($ask(34), 7));
+        $this->assertSame([], $asked);
+
+        $this->assertArrayHasKey('token', $realtime->authorizeCall($ask(34), 42));
+        $this->assertSame([[42, 34, ['pair' => '34:42'], 'support:34:42', ['role' => 'caller']]], $asked);
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall($ask(42), 34));
+    }
+
+    /** @return array<string, array{callable(Realtime): mixed, string}> */
+    public static function pairRefusals(): array
+    {
+        return [
+            'a public room' => [static fn (Realtime $r) => $r->room('chat:{pair}', null, ['public' => true]), 'take `{pair}` off'],
+            'a group call' => [static fn (Realtime $r) => $r->groupCalls('team:{pair}', static fn () => true), 'not a group call'],
+            'a live stream' => [static fn (Realtime $r) => $r->streams('show:{pair}', static fn () => 'host'), 'not a live stream'],
+            'people to add' => [static fn (Realtime $r) => $r->calls('support:{pair}', static fn () => true, ['people' => static fn () => []]), 'only ever those two'],
+            'any other call with no rule' => [static fn (Realtime $r) => $r->calls('support:{id}'), 'needs a rule'],
+        ];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('pairRefusals')]
+    public function test_pair_is_refused_where_it_means_nothing(callable $declare, string $message)
+    {
+        $this->expectExceptionMessage($message);
+        $declare($this->app());
     }
 
     public function test_a_room_needs_a_rule_and_a_public_room_has_no_members()
@@ -390,11 +731,12 @@ final class RealtimeTest extends TestCase
         $this->assertSame(['done' => false], $realtime->authorizeCall(['moderate' => 'meeting:7', 'act' => 'speak', 'user' => 'auth0|5f7c8e'], 1));
         $this->assertSame(['done' => false], $realtime->authorizeCall(['moderate' => 'meeting:7', 'act' => 'listen', 'user' => 42], 1));
         $this->assertSame(['done' => true], $realtime->authorizeCall(['moderate' => 'meeting:7', 'act' => 'remove', 'user' => '42'], 1));
+        // Each names its host as `by`; Make Listener and its promotion hold, a mute is once.
         $this->assertSame([
-            ['/wordplus/realtime/calls/meeting%3A7/mute', ['user' => '42', 'track' => 'microphone']],
-            ['/wordplus/realtime/calls/meeting%3A7/permit', ['user' => 'auth0|5f7c8e', 'publish' => true]],
-            ['/wordplus/realtime/calls/meeting%3A7/permit', ['user' => '42', 'publish' => false]],
-            ['/wordplus/realtime/calls/meeting%3A7/remove', ['user' => '42']],
+            ['/wordplus/realtime/calls/meeting%3A7/mute', ['user' => '42', 'track' => 'microphone', 'by' => '1']],
+            ['/wordplus/realtime/calls/meeting%3A7/permit', ['user' => 'auth0|5f7c8e', 'publish' => true, 'hold' => true, 'by' => '1']],
+            ['/wordplus/realtime/calls/meeting%3A7/permit', ['user' => '42', 'publish' => false, 'hold' => true, 'by' => '1']],
+            ['/wordplus/realtime/calls/meeting%3A7/remove', ['user' => '42', 'by' => '1']],
         ], array_map(static fn ($s) => [$s['path'], $s['body']], $this->sent));
 
         // Someone in it who isn't its host, a call no rule owns, an act or a person that isn't one, and the host themselves.
@@ -409,6 +751,300 @@ final class RealtimeTest extends TestCase
         $failing = $this->app(['http' => static fn () => ['status' => 500, 'body' => '{"ok":false,"error":"server"}']]);
         $failing->groupCalls('meeting:{id}', static fn () => ['admin' => true]);
         $this->assertSame(['denied' => 'server'], $failing->authorizeCall(['moderate' => 'meeting:7', 'act' => 'mute', 'user' => 42], 1));
+    }
+
+    public function test_the_calls_route_records_a_group_call_for_whoever_its_rule_lets_record_its_admin_by_default()
+    {
+        $realtime = $this->app([], static fn (string $path) => str_ends_with($path, '/start')
+            ? ['ok' => true, 'recording' => ['id' => 'rec_abcdefgh12', 'state' => 'recording']]
+            : ['ok' => true, 'state' => 'stopping']);
+        $realtime->groupCalls('meeting:{id}', static fn ($user) => match ($user) {
+            1 => ['admin' => true],
+            2 => ['record' => true],
+            3 => ['admin' => true, 'record' => false],
+            default => true,
+        });
+
+        $this->assertSame(['recording' => ['id' => 'rec_abcdefgh12', 'state' => 'recording']], $realtime->authorizeCall(['call' => 'meeting:7', 'record' => 'start'], 1));
+        $this->assertSame(['recording' => ['id' => 'rec_abcdefgh12', 'state' => 'stopping']], $realtime->authorizeCall(['call' => 'meeting:7', 'record' => 'stop', 'recording' => 'rec_abcdefgh12'], 2));
+        $this->assertSame([
+            ['/wordplus/realtime/recordings/start', ['product' => 'call', 'room' => 'meeting:7', 'type' => 'video', 'meta' => '{"by":"1"}']],
+            ['/wordplus/realtime/recordings/stop', ['recording' => 'rec_abcdefgh12']],
+        ], array_map(static fn ($s) => [$s['path'], $s['body']], $this->sent));
+
+        // The room's answer says whom the call screen offers it to, asking the rule the same way.
+        $offered = fn (int $user) => $realtime->authorizeCall(['room' => 'meeting:7', 'type' => 'video'], $user)['record'] ?? null;
+        $this->assertSame([false, false, null, null], [$offered(1), $offered(2), $offered(3), $offered(42)]);
+        // Held: the answer says true again once the switch is on.
+        Realtime::$recordingAvailable = true;
+        try {
+            $this->assertSame([true, true, null, null], [$offered(1), $offered(2), $offered(3), $offered(42)]);
+        } finally {
+            Realtime::$recordingAvailable = false;
+        }
+
+        // Its rule says no record for an admin, someone not its host, a stop naming no recording, an act that isn't one.
+        $this->sent = [];
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['call' => 'meeting:7', 'record' => 'start'], 3));
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['call' => 'meeting:7', 'record' => 'start'], 42));
+        $this->assertSame(['denied' => 'bad_request'], $realtime->authorizeCall(['call' => 'meeting:7', 'record' => 'stop'], 1));
+        $this->assertSame(['denied' => 'bad_request'], $realtime->authorizeCall(['call' => 'meeting:7', 'record' => 'pause'], 1));
+        $this->assertSame([], $this->sent);
+
+        // The cloud's refusal, for the call screen to say.
+        $spent = $this->app(['http' => static fn () => ['status' => 403, 'body' => '{"ok":false,"error":"no_credits"}']]);
+        $spent->groupCalls('meeting:{id}', static fn () => ['admin' => true]);
+        $this->assertSame(['denied' => 'no_credits'], $spent->authorizeCall(['call' => 'meeting:7', 'record' => 'start'], 1));
+    }
+
+    public function test_recordings_start_stop_read_and_sync_through_the_realtime_server()
+    {
+        $realtime = $this->app([], static fn (string $path) => match (true) {
+            str_ends_with($path, '/start') => ['ok' => true, 'recording' => ['id' => 'rec_stream0001', 'state' => 'recording']],
+            str_ends_with($path, '/status') => ['ok' => true, 'recording' => ['id' => 'rec_stream0001', 'state' => 'complete', 'files' => []]],
+            str_ends_with($path, '/sync') => ['ok' => true, 'recordings' => [['id' => 'rec_stream0001', 'files' => []]]],
+            default => ['ok' => true, 'state' => 'stopping'],
+        });
+        $recordings = $realtime->recordings();
+
+        $this->assertSame(['id' => 'rec_stream0001', 'state' => 'recording'], $recordings->start(['stream' => 'show:1', 'meta' => 'weekly', 'settings' => ['size' => 1080]]));
+        $this->assertSame('stopping', $recordings->stop('rec_stream0001'));
+        $this->assertSame('complete', $recordings->get('rec_stream0001')['state']);
+        $this->assertSame([['id' => 'rec_stream0001', 'files' => []]], $recordings->sync(['rec_older00001'], 5));
+        $this->assertSame([
+            ['/wordplus/realtime/recordings/start', ['product' => 'stream', 'stream' => 'show:1', 'meta' => 'weekly', 'settings' => ['size' => 1080]]],
+            ['/wordplus/realtime/recordings/stop', ['recording' => 'rec_stream0001']],
+            ['/wordplus/realtime/recordings/status', ['recording' => 'rec_stream0001']],
+            ['/wordplus/realtime/recordings/sync', ['ack' => ['rec_older00001'], 'limit' => 5]],
+        ], array_map(static fn ($s) => [$s['path'], $s['body']], $this->sent));
+    }
+
+    public function test_the_calls_route_takes_a_hosts_spotlight_themselves_too_and_takes_everyone_out_with_nobody_named()
+    {
+        $realtime = $this->app([], static fn () => ['ok' => true, 'changed' => true, 'spotlight' => []]);
+        $realtime->groupCalls('meeting:{id}', static fn ($user) => 1 === $user ? ['admin' => true] : true);
+
+        $this->assertSame(['done' => true], $realtime->authorizeCall(['moderate' => 'meeting:7', 'act' => 'spotlight', 'user' => 42], 1));
+        $this->assertSame(['done' => true], $realtime->authorizeCall(['moderate' => 'meeting:7', 'act' => 'spotlight', 'user' => 1], 1));
+        $this->assertSame(['done' => true], $realtime->authorizeCall(['moderate' => 'meeting:7', 'act' => 'unspotlight', 'user' => 42], 1));
+        $this->assertSame(['done' => true], $realtime->authorizeCall(['moderate' => 'meeting:7', 'act' => 'unspotlight', 'user' => null], 1));
+        $this->assertSame([
+            ['/wordplus/realtime/calls/meeting%3A7/spotlight', ['user' => '42', 'on' => true]],
+            ['/wordplus/realtime/calls/meeting%3A7/spotlight', ['user' => '1', 'on' => true]],
+            ['/wordplus/realtime/calls/meeting%3A7/spotlight', ['user' => '42', 'on' => false]],
+            ['/wordplus/realtime/calls/meeting%3A7/spotlight', ['on' => false]],
+        ], array_map(static fn ($s) => [$s['path'], $s['body']], $this->sent));
+
+        // Nobody named is for taking everyone out alone, and a member spotlights nobody.
+        $this->sent = [];
+        $this->assertSame(['denied' => 'bad_request'], $realtime->authorizeCall(['moderate' => 'meeting:7', 'act' => 'spotlight', 'user' => null], 1));
+        $this->assertSame(['denied' => 'bad_request'], $realtime->authorizeCall(['moderate' => 'meeting:7', 'act' => 'mute', 'user' => null], 1));
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['moderate' => 'meeting:7', 'act' => 'spotlight', 'user' => 42], 42));
+        $this->assertSame([], $this->sent);
+
+        // A fifth person: the cloud's refusal, for the call screen to say.
+        $full = $this->app(['http' => static fn () => ['status' => 409, 'body' => '{"ok":false,"error":"spotlight_full"}']]);
+        $full->groupCalls('meeting:{id}', static fn () => ['admin' => true]);
+        $this->assertSame(['denied' => 'spotlight_full'], $full->authorizeCall(['moderate' => 'meeting:7', 'act' => 'spotlight', 'user' => 42], 1));
+    }
+
+    public function test_the_calls_route_takes_every_act_of_a_hosts_screen_as_better_messages_holds_them()
+    {
+        $answers = [
+            'mute' => ['ok' => true, 'muted' => false],
+            'unmute' => ['ok' => true, 'changed' => true],
+            'ban' => ['ok' => true, 'removed' => false, 'until' => 1791640000000],
+            'unban' => ['ok' => true, 'unbanned' => true],
+            'rules' => ['ok' => true, 'rules' => ['mode' => 'broadcast', 'locked' => true, 'muted' => false]],
+            'ask' => ['ok' => true, 'id' => 'ask_1', 'devices' => ['camera']],
+            'end' => ['ok' => true],
+        ];
+        $realtime = $this->app([], static fn (string $path) => $answers[basename($path)] ?? ['ok' => true]);
+        $realtime->groupCalls('meeting:{id}', static fn ($user) => 1 === $user ? ['admin' => true] : true);
+        $act = static fn (array $request) => $realtime->authorizeCall(['moderate' => 'meeting:7'] + $request, 1);
+
+        $this->assertSame(['done' => true], $act(['act' => 'hold_mic', 'user' => 42]));
+        $this->assertSame(['done' => true], $act(['act' => 'release_mic', 'user' => 42]));
+        $this->assertSame(['done' => true], $act(['act' => 'ban', 'user' => 42, 'minutes' => 30]));
+        $this->assertSame(['done' => true], $act(['act' => 'ban', 'user' => 'auth0|5f7c8e']));
+        $this->assertSame(['done' => true], $act(['act' => 'unban', 'user' => 42]));
+        $this->assertSame(['done' => true, 'rules' => ['mode' => 'broadcast', 'locked' => true, 'muted' => false]], $act(['act' => 'rules', 'user' => null, 'rules' => ['mode' => 'broadcast', 'locked' => true]]));
+        $this->assertSame(['done' => true, 'id' => 'ask_1'], $act(['act' => 'ask', 'user' => 42, 'devices' => ['camera']]));
+        $this->assertSame(['done' => true], $act(['act' => 'end', 'user' => null]));
+        $this->assertSame([
+            ['/mute', ['user' => '42', 'track' => 'microphone', 'hold' => true, 'by' => '1']],
+            ['/unmute', ['user' => '42', 'by' => '1']],
+            ['/ban', ['user' => '42', 'minutes' => 30, 'by' => '1']],
+            ['/ban', ['user' => 'auth0|5f7c8e', 'by' => '1']],
+            ['/unban', ['user' => '42', 'by' => '1']],
+            ['/rules', ['mode' => 'broadcast', 'locked' => true, 'by' => '1']],
+            ['/ask', ['user' => '42', 'devices' => ['camera'], 'by' => '1']],
+            ['/end', ['by' => '1']],
+        ], array_map(static fn ($s) => [str_replace('/wordplus/realtime/calls/meeting%3A7', '', $s['path']), $s['body']], $this->sent));
+
+        // What an act carries is checked before anyone is asked: a ban's minutes, an ask's devices, the rules, and rules
+        // and end, which name nobody.
+        $this->sent = [];
+        foreach ([
+            ['act' => 'ban', 'user' => 42, 'minutes' => 0], ['act' => 'ban', 'user' => 42, 'minutes' => 10081], ['act' => 'ban', 'user' => 42, 'minutes' => 1.5],
+            ['act' => 'ask', 'user' => 42], ['act' => 'ask', 'user' => 42, 'devices' => []], ['act' => 'ask', 'user' => 42, 'devices' => ['screen']], ['act' => 'ask', 'user' => 42, 'devices' => ['camera', 'camera']],
+            ['act' => 'rules', 'user' => null], ['act' => 'rules', 'user' => null, 'rules' => []], ['act' => 'rules', 'user' => null, 'rules' => ['mode' => 'quiet']], ['act' => 'rules', 'user' => null, 'rules' => ['locked' => 'yes']],
+            ['act' => 'rules', 'user' => 42, 'rules' => ['locked' => true]], ['act' => 'end', 'user' => 42], ['act' => 'ban', 'user' => 1], ['act' => 'ask', 'user' => 1, 'devices' => ['camera']],
+            ['act' => 'record', 'user' => 42], ['act' => 'hand', 'user' => 42],
+        ] as $wrong) {
+            $this->assertSame(['denied' => 'bad_request'], $act($wrong), json_encode($wrong));
+        }
+        // Someone who isn't its host.
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['moderate' => 'meeting:7', 'act' => 'end', 'user' => null], 42));
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['moderate' => 'meeting:7', 'act' => 'ban', 'user' => 43], 42));
+        $this->assertSame([], $this->sent);
+
+        // The cloud's refusals the screen says in its own words: a host banned, an ask again, someone gone.
+        foreach ([['forbidden', 403], ['asked_recently', 429], ['not_in_call', 404]] as [$code, $status]) {
+            $refusing = $this->app(['http' => static fn () => ['status' => $status, 'body' => (string) json_encode(['ok' => false, 'error' => $code])]]);
+            $refusing->groupCalls('meeting:{id}', static fn () => ['admin' => true]);
+            $this->assertSame(['denied' => $code], $refusing->authorizeCall(['moderate' => 'meeting:7', 'act' => 'ask', 'user' => 42, 'devices' => ['microphone']], 1));
+        }
+    }
+
+    public function test_a_host_acts_on_the_new_acts_with_the_proof_of_its_token_and_a_member_proof_is_no_hosts()
+    {
+        $realtime = $this->app([], static fn () => ['ok' => true, 'until' => 1, 'removed' => true]);
+        $host = $this->madeCall($realtime->groupCallToken(1, 'class:7', ['admin' => true]));
+        $member = $this->madeCall($realtime->groupCallToken(42, 'class:7'));
+
+        $this->assertSame(['done' => true], $realtime->authorizeCall(['moderate' => 'class:7', 'act' => 'ban', 'user' => 42, 'host' => $host['host']], 1));
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['moderate' => 'class:7', 'act' => 'ban', 'user' => 43, 'host' => $member['member']], 42));
+        $this->assertCount(1, $this->sent);
+    }
+
+    public function test_every_group_call_token_and_room_answer_names_its_acts_and_everyone_gets_the_proof_of_being_in_it()
+    {
+        $realtime = $this->app();
+        $realtime->groupCalls('meeting:{id}', static fn ($user) => 1 === $user ? ['admin' => true] : true);
+        $acts = ['remove', 'ban', 'listen', 'speak', 'mute', 'hold_mic', 'release_mic', 'rules', 'hand', 'ask', 'end', 'spotlight'];
+
+        $host = $this->madeCall($realtime->groupCallToken(1, 'class:7', ['admin' => true]));
+        $member = $this->madeCall($realtime->groupCallToken(42, 'class:7'));
+        $this->assertSame($acts, $host['acts']);
+        $this->assertSame($acts, $member['acts']);
+        $this->assertIsInt($member['member']['until']);
+        $this->assertIsString($member['member']['proof']);
+        $this->assertNotSame($host['member']['proof'], $member['member']['proof']);
+        $this->assertArrayNotHasKey('host', $member);
+        // No recording is offered among them.
+        $this->assertNotContains('record', $member['acts']);
+
+        $this->assertSame($acts, $realtime->authorizeCall(['room' => 'meeting:7', 'type' => 'video'], 42)['acts']);
+        $this->assertSame($acts, $realtime->authorizeCall(['room' => 'meeting:7', 'type' => 'video'], 1)['acts']);
+        $this->assertArrayNotHasKey('acts', $realtime->authorizeCall(['room' => 'board:7', 'type' => 'video'], 1));
+    }
+
+    public function test_the_calls_route_takes_a_raised_hand_from_anyone_in_the_call_and_a_lowered_one_from_a_host()
+    {
+        $realtime = $this->app([], static fn (string $path) => str_ends_with($path, '/lower') ? ['ok' => true, 'lowered' => 2] : ['ok' => true, 'changed' => true]);
+        $realtime->groupCalls('meeting:{id}', static fn ($user) => 1 === $user ? ['admin' => true] : 42 === $user);
+        $made = $this->madeCall($realtime->groupCallToken(56, 'class:7'));
+        $host = $this->madeCall($realtime->groupCallToken(1, 'class:7', ['admin' => true]));
+
+        $this->assertSame(['done' => true], $realtime->authorizeCall(['hand' => 'meeting:7', 'up' => true], 42));
+        $this->assertSame(['done' => true], $realtime->authorizeCall(['hand' => 'meeting:7', 'up' => false], 42));
+        $this->assertSame(['done' => true], $realtime->authorizeCall(['hand' => 'class:7', 'up' => true, 'member' => $made['member']], 56));
+        $this->assertSame(['done' => true], $realtime->authorizeCall(['hand' => 'meeting:7', 'up' => false, 'user' => 42], 1));
+        $this->assertSame(['done' => true], $realtime->authorizeCall(['hand' => 'meeting:7', 'up' => false, 'user' => null], 1));
+        $this->assertSame(['done' => true], $realtime->authorizeCall(['hand' => 'class:7', 'up' => false, 'user' => 56, 'host' => $host['host']], 1));
+        $this->assertSame([
+            ['/wordplus/realtime/calls/meeting%3A7/hand', ['user' => '42', 'up' => true]],
+            ['/wordplus/realtime/calls/meeting%3A7/hand', ['user' => '42', 'up' => false]],
+            ['/wordplus/realtime/calls/class%3A7/hand', ['user' => '56', 'up' => true]],
+            ['/wordplus/realtime/calls/meeting%3A7/hand', ['user' => '42', 'up' => false]],
+            ['/wordplus/realtime/calls/meeting%3A7/hands/lower', ['by' => '1']],
+            ['/wordplus/realtime/calls/class%3A7/hand', ['user' => '56', 'up' => false]],
+        ], array_map(static fn ($s) => [$s['path'], $s['body']], $this->sent));
+
+        // Someone the rule keeps out, a proof of another user or call, a member lowering another's, a host raising one.
+        $this->sent = [];
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['hand' => 'meeting:7', 'up' => true], 43));
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['hand' => 'class:7', 'up' => true], 56));
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['hand' => 'class:7', 'up' => true, 'member' => $made['member']], 57));
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['hand' => 'class:8', 'up' => true, 'member' => $made['member']], 56));
+        $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['hand' => 'meeting:7', 'up' => false, 'user' => 43], 42));
+        $this->assertSame(['denied' => 'bad_request'], $realtime->authorizeCall(['hand' => 'meeting:7', 'up' => true, 'user' => 43], 1));
+        $this->assertSame(['denied' => 'bad_request'], $realtime->authorizeCall(['hand' => 'meeting:7', 'up' => 'yes'], 42));
+        $this->assertSame(['denied' => 'bad_request'], $realtime->authorizeCall(['hand' => 'meeting:7', 'up' => false, 'user' => 'two words'], 1));
+        $this->assertSame([], $this->sent);
+    }
+
+    public function test_a_call_sends_what_1_1_0_sent_when_left_as_it_was_and_the_holds_and_by_only_when_given()
+    {
+        $realtime = $this->app([], static fn () => ['ok' => true, 'muted' => true, 'removed' => true, 'changed' => true, 'unbanned' => true, 'lowered' => 0, 'until' => 5, 'rules' => ['mode' => 'participatory', 'locked' => true, 'muted' => false], 'bans' => [['user' => '43', 'until' => 5], ['user' => '44', 'until' => null]], 'id' => 'a1', 'devices' => ['microphone']]);
+        $call = $realtime->call('meeting:7');
+
+        $this->assertTrue($call->mute(42));
+        $this->assertTrue($call->remove(42));
+        $this->assertTrue($call->permit(42, ['publish' => true]));
+        $this->assertTrue($call->letSpeak(42));
+        $call->end();
+        $this->assertTrue($call->mute(42, 'microphone', ['hold' => true, 'by' => 1]));
+        $this->assertTrue($call->unmute(42));
+        $this->assertTrue($call->permit(42, ['publish' => false, 'hold' => true, 'by' => 1]));
+        $this->assertTrue($call->remove(42, ['by' => 1]));
+        $this->assertSame(['removed' => true, 'until' => 5], $call->ban(42, ['minutes' => 60, 'by' => 1]));
+        $this->assertTrue($call->unban(42));
+        $this->assertSame([['user' => '43', 'until' => 5], ['user' => '44', 'until' => null]], $call->bans());
+        $this->assertSame(['mode' => 'participatory', 'locked' => true, 'muted' => false], $call->rules(['locked' => true]));
+        $this->assertTrue($call->hand(42, true));
+        $this->assertSame(0, $call->lowerHands());
+        $this->assertSame(['id' => 'a1', 'devices' => ['microphone']], $call->ask(42, ['microphone'], 1));
+        $call->end(['by' => 1]);
+
+        $this->assertSame([
+            ['POST', '/mute', ['user' => '42', 'track' => 'microphone']],
+            ['POST', '/remove', ['user' => '42']],
+            ['POST', '/permit', ['user' => '42', 'publish' => true]],
+            ['POST', '/permit', ['user' => '42', 'publish' => true]],
+            ['POST', '/end', null],
+            ['POST', '/mute', ['user' => '42', 'track' => 'microphone', 'hold' => true, 'by' => '1']],
+            ['POST', '/unmute', ['user' => '42']],
+            ['POST', '/permit', ['user' => '42', 'publish' => false, 'hold' => true, 'by' => '1']],
+            ['POST', '/remove', ['user' => '42', 'by' => '1']],
+            ['POST', '/ban', ['user' => '42', 'minutes' => 60, 'by' => '1']],
+            ['POST', '/unban', ['user' => '42']],
+            ['GET', '/bans', null],
+            ['POST', '/rules', ['locked' => true]],
+            ['POST', '/hand', ['user' => '42', 'up' => true]],
+            ['POST', '/hands/lower', null],
+            ['POST', '/ask', ['user' => '42', 'devices' => ['microphone'], 'by' => '1']],
+            ['POST', '/end', ['by' => '1']],
+        ], array_map(static fn ($s) => [$s['method'], str_replace('/wordplus/realtime/calls/meeting%3A7', '', $s['path']), $s['body']], $this->sent));
+    }
+
+    public function test_the_calls_route_still_takes_a_1_1_0_screens_act_with_no_acts_member_or_the_new_fields()
+    {
+        $realtime = $this->app([], static fn () => ['ok' => true, 'muted' => true, 'removed' => true, 'changed' => true]);
+        $host = $this->madeCall($realtime->groupCallToken(1, 'class:7', ['admin' => true]));
+        $this->assertSame(['done' => true], $realtime->authorizeCall(['moderate' => 'class:7', 'act' => 'mute', 'user' => 42, 'host' => $host['host']], 1));
+        $this->assertSame(['done' => true], $realtime->authorizeCall(['moderate' => 'class:7', 'act' => 'unspotlight', 'user' => null, 'host' => $host['host']], 1));
+        $this->assertSame([['user' => '42', 'track' => 'microphone', 'by' => '1'], ['on' => false]], array_map(static fn ($s) => $s['body'], $this->sent));
+    }
+
+    public function test_a_webhook_hands_a_hosts_act_in_a_group_call_to_its_handler()
+    {
+        $realtime = $this->app(['now' => static fn () => (int) self::$v['webhook']['timestamp']]);
+        $acts = [];
+        $realtime->on('call.moderated', static function (array $e) use (&$acts) {
+            $acts[] = [$e['act'], $e['call'], $e['user'], $e['by'], $e['held'], $e['minutes'] ?? null, $e['rules'] ?? null];
+        });
+
+        $body = (string) json_encode(['events' => [
+            ['id' => 'm1', 'at' => 1, 'type' => 'call.moderated', 'call' => 'meeting:7', 'act' => 'ban', 'user' => '43', 'by' => '1', 'held' => true, 'minutes' => 30],
+            ['id' => 'm2', 'at' => 2, 'type' => 'call.moderated', 'call' => 'meeting:7', 'act' => 'rules', 'user' => null, 'by' => null, 'held' => true, 'rules' => ['mode' => 'broadcast', 'locked' => false, 'muted' => false]],
+        ]]);
+        $this->assertSame(204, $realtime->webhook($body, $this->hookHeaders($body), self::$v['webhook']['path'])['status']);
+        $this->assertSame([
+            ['ban', 'meeting:7', '43', '1', true, 30, null],
+            ['rules', 'meeting:7', null, null, true, null, ['mode' => 'broadcast', 'locked' => false, 'muted' => false]],
+        ], $acts);
     }
 
     public function test_the_calls_route_answers_whether_a_user_may_call_each_person_for_the_call_buttons_of_a_list()
@@ -492,7 +1128,27 @@ final class RealtimeTest extends TestCase
         $asked = $realtime->keysAnswer(['d:'.($today + 1), 'd:'.($today + 2), 'u:42:1', 'u:43:1', 'ch:order:42:1', 'ch:order:42:2', 'ch:order:43:1', 'ch:news:1', 'note:7', 'note:8', 'nonsense'], 42);
         $this->assertSame([$keys->entry('d:'.($today + 1)), $keys->entry('u:42:1'), $keys->entry('ch:order:42:1'), $keys->entry('note:7')], $asked['keys']);
 
-        $this->assertSame(['keys' => []], $realtime->keysAnswer([], null));
+        $this->assertSame(['keys' => [], 'app' => self::$v['site']], $realtime->keysAnswer([], null));
+    }
+
+    /**
+     * The server keeps an entry as long as its hash matches: with one hash for weeks, a user who kept reconnecting kept an
+     * entry sealed weeks ago (wordplus/realtime 64ca239). @wordplus/realtime c95f330.
+     */
+    public function testTheDirectoryHashFollowsTheDayWhereTheEntryIsSealed(): void
+    {
+        $keys = $this->keys();
+        $monday = $keys->profile(42, ['name' => 'Ann'], true, 20395)['pdh'];
+        $tuesday = $keys->profile(42, ['name' => 'Ann'], true, 20396)['pdh'];
+
+        $this->assertMatchesRegularExpression('/^[0-9a-f]{64}$/', $monday);
+        $this->assertSame('00004fab', substr($monday, -8));
+        $this->assertSame('00004fac', substr($tuesday, -8));
+        $this->assertSame(substr($monday, 0, 56), substr($tuesday, 0, 56));
+        $this->assertNotSame(substr($monday, 0, 56), substr($keys->profile(42, ['name' => 'Ben'], true, 20395)['pdh'], 0, 56));
+
+        // Nothing sealed, so nothing follows the day.
+        $this->assertSame($keys->profile(42, ['name' => 'Ann'], false, 20395)['pdh'], $keys->profile(42, ['name' => 'Ann'], false, 20396)['pdh']);
     }
 
     public function test_a_string_id_gets_its_keys_and_identity_and_a_hidden_user_is_marked()
@@ -527,8 +1183,26 @@ final class RealtimeTest extends TestCase
 
     public function test_no_key_for_a_user_cut_off_and_no_identity_without_a_profile()
     {
-        $this->assertSame(['keys' => []], $this->app(['has_keys' => static fn ($user) => 42 !== $user])->keysAnswer([], 42));
+        $this->assertSame(['keys' => [], 'app' => self::$v['site']], $this->app(['has_keys' => static fn ($user) => 42 !== $user])->keysAnswer([], 42));
         $this->assertArrayNotHasKey('identity', $this->app(['profile' => static fn () => null])->keysAnswer([], 42));
+    }
+
+    public function test_an_emit_carries_bytes_as_pages_read_them_sealed_or_plain()
+    {
+        $realtime = $this->app();
+        $realtime->room('order:{id}', static fn () => true);
+        $realtime->room('news', null, ['public' => true]);
+        $bytes = "\xff\x00\xfe";
+
+        $realtime->to('news')->emit('picture', ['file' => new Binary($bytes), 'name' => 'a.png']);
+        $this->assertSame(['file' => ['$b' => base64_encode($bytes)], 'name' => 'a.png'], $this->sent[0]['body']['data']);
+
+        $realtime->to('order:42')->emit('picture', ['file' => new Binary($bytes)]);
+        $sealed = $this->keys()->open($this->sent[1]['body']['data']);
+        $this->assertSame(['file' => ['$b' => base64_encode($bytes)]], json_decode((string) $sealed, true));
+
+        // Read back as bytes, as the Node and Python packages open them.
+        $this->assertSame(['file' => $bytes], $realtime->opened($this->sent[1]['body']['data']));
     }
 
     public function test_an_emit_seals_a_sealed_rooms_data_a_copy_each_sends_the_others_together_and_says_which_keep_it()
@@ -620,6 +1294,124 @@ final class RealtimeTest extends TestCase
         ], array_map(static fn ($s) => [$s['method'], $s['path']], $this->sent));
         $this->assertSame(['user' => '43'], $this->sent[4]['body']);
         $this->assertSame(2, $store->get('ch:chat:1'));
+    }
+
+    public function test_one_room_by_its_name_alone_reads_it_sends_to_it_and_takes_someone_out_as_in_and_kick_still_do()
+    {
+        $realtime = $this->app(['generations' => $this->store()], static fn (string $path) => str_ends_with($path, '/emit')
+            ? ['ok' => true, 'ids' => ['chat:1' => '1-0']]
+            : ['ok' => true, 'count' => 3]);
+        $room = $realtime->room('chat:1');
+
+        $this->assertSame(3, $room->count());
+        $this->assertSame(['chat:1' => '1-0'], $room->emit('renamed', ['title' => 'Team']));
+        $room->remove(43);
+        $realtime->in('chat:1')->kick(44);
+
+        $this->assertSame([
+            ['GET', '/wordplus/realtime/rooms/chat%3A1'],
+            ['POST', '/wordplus/realtime/emit'],
+            ['POST', '/wordplus/realtime/rooms/chat%3A1/kick'],
+            ['POST', '/wordplus/realtime/rooms/chat%3A1/kick'],
+        ], array_map(static fn ($s) => [$s['method'], $s['path']], $this->sent));
+        $this->assertSame(['user' => '43'], $this->sent[2]['body']);
+        $this->assertSame(['user' => '44'], $this->sent[3]['body']);
+    }
+
+    public function test_everyone_out_of_a_room_and_its_rule_asked_again_for_one_or_all_moving_its_key_on_each_time()
+    {
+        $store = $this->store();
+        $realtime = $this->app(['generations' => $store], static fn () => ['ok' => true]);
+        $room = $realtime->room('chat:1');
+
+        $room->removeEveryone();
+        $this->assertSame(2, $store->get('ch:chat:1'));
+        $room->recheck(43);
+        $this->assertSame(3, $store->get('ch:chat:1'));
+        $room->recheckEveryone();
+        $this->assertSame(4, $store->get('ch:chat:1'));
+
+        $this->assertSame([
+            ['/wordplus/realtime/rooms/chat%3A1/kick', ['everyone' => true]],
+            ['/wordplus/realtime/rooms/chat%3A1/recheck', ['user' => '43']],
+            ['/wordplus/realtime/rooms/chat%3A1/recheck', ['everyone' => true]],
+        ], array_map(static fn ($s) => [$s['path'], $s['body']], $this->sent));
+    }
+
+    public function test_sending_to_everyone_with_no_room_to_join_never_sealed_leaving_out_the_tab_named()
+    {
+        $realtime = $this->app([], static fn () => ['ok' => true, 'ids' => (object) []]);
+
+        $realtime->toEveryone()->emit('notice', ['text' => 'Back at 9']);
+        $this->assertSame('/wordplus/realtime/emit', $this->sent[0]['path']);
+        $this->assertSame(['everyone' => true, 'event' => 'notice', 'data' => ['text' => 'Back at 9']], $this->sent[0]['body']);
+
+        $realtime->toEveryone()->except('tab1')->emit('notice');
+        $this->assertSame(['everyone' => true, 'event' => 'notice', 'data' => null, 'except' => 'tab1'], $this->sent[1]['body']);
+
+        $realtime->batch([['everyone' => true, 'event' => 'notice', 'data' => 1]]);
+        $this->assertSame(['everyone' => true, 'event' => 'notice', 'data' => 1], $this->sent[2]['body']);
+
+        foreach ([['rooms' => 'chat:1'], ['users' => 42]] as $mixed) {
+            try {
+                $realtime->emitEvent(['everyone' => true, 'event' => 'notice'] + $mixed);
+                $this->fail('Everyone goes on its own.');
+            } catch (RealtimeError $refused) {
+                $this->assertSame('bad_request', $refused->errorCode);
+            }
+        }
+
+        $this->assertCount(3, $this->sent);
+    }
+
+    public function test_a_room_token_says_when_it_was_signed_to_the_millisecond_within_its_second_and_a_public_grant_does_not()
+    {
+        $claimsOf = static fn (string $token) => json_decode(base64_decode(strtr(explode('.', $token)[1], '-_', '+/')), true);
+
+        $realtime = $this->app();
+        $realtime->room('chat:{id}', static fn ($user) => 42 === $user);
+        $realtime->room('news:{id}', null, ['public' => true]);
+
+        $room = $claimsOf($realtime->authorize(['chat:1'], 42)['token']);
+        $this->assertSame($room['iat'], intdiv($room['ms'], 1000));
+        $this->assertArrayNotHasKey('ms', $claimsOf($realtime->publicGrants()[0]['token']));
+
+        // A clock given in the options says another second than the machine's, and `ms` stays within `iat`.
+        $fixed = $this->app(['now' => static fn () => 1800000000]);
+        $fixed->room('chat:{id}', static fn ($user) => 42 === $user);
+        $this->assertSame(1800000000000, $claimsOf($fixed->authorize(['chat:1'], 42)['token'])['ms']);
+    }
+
+    public function test_call_group_call_and_stream_tokens_say_when_they_were_signed_to_the_millisecond_as_a_room_token_does()
+    {
+        $claimsOf = static fn (string $token) => json_decode(base64_decode(strtr(explode('.', $token)[1], '-_', '+/')), true);
+        $tokens = function (Realtime $realtime): array {
+            $realtime->groupCalls('meeting:{id}', static fn () => true);
+
+            return [
+                'callToken' => $this->madeCall($realtime->callToken(42, 34))['token'],
+                'groupCallToken' => $this->madeCall($realtime->groupCallToken(42, 'class:7'))['token'],
+                'groupCalls' => $realtime->authorizeCall(['room' => 'meeting:daily'], 42)['token'],
+                'streamToken' => $this->madeCall($realtime->streamToken(42, 'show:7'))['token'],
+            ];
+        };
+
+        $before = (int) floor(microtime(true) * 1000);
+        $made = $tokens($this->app());
+        $after = (int) floor(microtime(true) * 1000);
+        foreach ($made as $what => $token) {
+            $claims = $claimsOf($token);
+            $this->assertGreaterThanOrEqual($before, $claims['ms'], $what);
+            $this->assertLessThanOrEqual($after, $claims['ms'], $what);
+            $this->assertSame($claims['iat'], intdiv($claims['ms'], 1000), $what);
+        }
+        // In a stream's grant `ms` comes right after `iat`, as every language orders it.
+        $this->assertSame(['iat', 'ms', 'exp'], array_slice(array_keys($claimsOf($made['streamToken'])), -3));
+
+        // A clock given in the options says another second than the machine's, and `ms` stays within `iat`.
+        foreach ($tokens($this->app(['now' => static fn () => 1800000000])) as $what => $token) {
+            $this->assertSame(1800000000000, $claimsOf($token)['ms'], $what);
+        }
     }
 
     public function test_reading_who_is_online()
@@ -881,7 +1673,7 @@ final class RealtimeTest extends TestCase
 
         // The copies are the files their manifest names, so a copy left behind fails here.
         $manifest = json_decode((string) file_get_contents(Realtime::FILES_DIR.'/files.json'), true);
-        $this->assertSame(['realtime.js', 'realtime-worker.js', 'realtime-rooms.min.js', 'realtime-rooms-e2ee.worker.js', 'realtime-ui.min.js', 'realtime-ui-streams.min.js'], array_keys($manifest['files']));
+        $this->assertSame(['realtime.js', 'realtime-worker.js', 'realtime-rooms.min.js', 'realtime-rooms-e2ee.worker.js', 'realtime-ui.min.js', 'realtime-ui-streams.min.js', 'realtime-ui-recording.min.js', 'hls.light.min.js'], array_keys($manifest['files']));
         foreach ($manifest['files'] as $name => $sha) {
             $this->assertSame($sha, hash_file('sha256', Realtime::FILES_DIR.'/'.$name), $name);
             $answer = $realtime->file('GET', $realtime->fileAt($name).'?x=1');
@@ -935,9 +1727,50 @@ final class RealtimeTest extends TestCase
 
         try {
             $this->assertSame('s1', Realtime::fromEnvironment()->site());
+            $this->assertSame('s1', Realtime::fromEnvironment()->app());
+            $this->assertSame('s2', Realtime::fromEnvironment(['app' => 's2'])->app());
         } finally {
             unset($_ENV['WORDPLUS_SITE'], $_ENV['WORDPLUS_SECRET'], $_ENV['WORDPLUS_LOCAL_KEY']);
         }
+    }
+
+    public function test_the_app_is_named_app_and_still_site()
+    {
+        $options = ['secret' => 'x', 'local_key' => self::$v['local_key']];
+
+        $this->assertSame('s1', (new Realtime(['app' => 's1'] + $options))->app());
+        $this->assertSame('s1', (new Realtime(['site' => 's1'] + $options))->app());
+        $this->assertSame('s1', (new Realtime(['app' => 's1', 'site' => 's2'] + $options))->config()['site']);
+
+        $this->expectExceptionMessage('WORDPLUS_SITE and WORDPLUS_SECRET');
+        new Realtime($options);
+    }
+
+    public function test_the_keys_route_names_the_app_for_a_page_that_connects_with_no_options()
+    {
+        $realtime = $this->app();
+
+        $this->assertSame(self::$v['site'], $realtime->keysAnswer([], null)['app']);
+        $this->assertSame(self::$v['site'], $realtime->keysAnswer([], 42)['app']);
+        // Keys asked for by name are that and nothing more.
+        $this->assertArrayNotHasKey('app', $realtime->keysAnswer(['u:42:1'], 42));
+    }
+
+    public function test_a_rooms_history_keeps_the_seconds_it_names_within_the_clouds_five_minutes()
+    {
+        $realtime = $this->app();
+        $realtime->room('a:{id}', static fn () => true, ['history' => ['last' => 30, 'seconds' => 120]]);
+        $realtime->room('b:{id}', static fn () => true, ['history' => ['last' => 30, 'seconds' => '120']]);
+        $realtime->room('c:{id}', static fn () => true, ['history' => ['last' => 30, 'seconds' => 3600]]);
+        $realtime->room('d:{id}', static fn () => true, ['history' => ['last' => 30, 'seconds' => 0]]);
+
+        $max = Realtime::MAX_HISTORY_DAYS;
+        $this->assertEquals([
+            'a:1' => ['h' => [30, 120 / 86400]],
+            'b:1' => ['h' => [30, 120 / 86400]],
+            'c:1' => ['h' => [30, $max]],
+            'd:1' => ['h' => [30, $max]],
+        ], $this->claims($realtime->authorize(['a:1', 'b:1', 'c:1', 'd:1'], 42)['token'], 'wordplus-realtime channels v1')['r']);
     }
 
     public function test_live_streams_sign_easy_streams_own_vectors()
@@ -966,7 +1799,7 @@ final class RealtimeTest extends TestCase
 
         $host = $realtime->authorizeCall(['stream' => 'show:42'], 1);
         $claims = $this->claims($host['token'], 'easy-stream grant v1');
-        $this->assertSame(['iss', 'aud', 'str', 'role', 'sub', 'name', 'avatar', 'q', 'stage', 'offline', 'links', 'reactions', 'iat', 'exp'], array_keys($claims));
+        $this->assertSame(['iss', 'aud', 'str', 'role', 'sub', 'name', 'avatar', 'q', 'stage', 'offline', 'links', 'reactions', 'iat', 'ms', 'exp'], array_keys($claims));
         $this->assertSame(['iss' => self::$v['site'], 'aud' => 'easy-stream', 'str' => 'show:42', 'role' => 'host', 'sub' => '1', 'name' => 'User 1', 'avatar' => 'https://example.com/1.png', 'q' => '720p', 'stage' => false, 'offline' => 'open', 'links' => false, 'reactions' => true], array_slice($claims, 0, 12));
         $this->assertSame(600, $claims['exp'] - $claims['iat']);
         $this->assertSame($claims['exp'], $host['exp']);
@@ -984,5 +1817,101 @@ final class RealtimeTest extends TestCase
 
         $realtime->streams('open:{id}', static fn () => 'host');
         $this->assertSame(['denied' => 'no_user'], $realtime->authorizeCall(['stream' => 'open:1'], null));
+    }
+
+    public function testAUserIsSentToFromTheirOwnHandleAsARoomFromItsOwn(): void
+    {
+        $realtime = $this->app();
+
+        $realtime->user(42)->emit('notice', ['text' => 'Hi'], ['seal' => false, 'except' => 'tab-1']);
+        $realtime->room('order:42')->emit('updated', ['status' => 'paid'], ['seal' => false, 'except' => 'tab-2']);
+        $realtime->to('order:42')->except('tab-3')->emit('updated', [], ['seal' => false]);
+
+        $this->assertSame('/wordplus/realtime/emit', $this->sent[0]['path']);
+        $this->assertSame(['users' => ['42'], 'event' => 'notice', 'data' => ['text' => 'Hi'], 'except' => 'tab-1'], $this->sent[0]['body']);
+        $this->assertSame('tab-2', $this->sent[1]['body']['except']);
+        $this->assertSame('tab-3', $this->sent[2]['body']['except']);
+    }
+
+    public function testAHostOnTheServerHasTheWordsAHostHasOnThePage(): void
+    {
+        $realtime = $this->app([], static fn () => ['ok' => true, 'muted' => true, 'changed' => true]);
+        $call = $realtime->call('meeting:7');
+
+        $this->assertTrue($call->mute(42));
+        $this->assertTrue($call->letSpeak(43));
+        $this->assertTrue($call->makeListener(43));
+        $this->assertTrue($call->spotlightOn(43));
+        $this->assertTrue($call->spotlightOff(43));
+        $this->assertTrue($call->spotlightOff());
+
+        $this->assertSame([
+            ['/wordplus/realtime/calls/meeting%3A7/mute', ['user' => '42', 'track' => 'microphone']],
+            ['/wordplus/realtime/calls/meeting%3A7/permit', ['user' => '43', 'publish' => true]],
+            ['/wordplus/realtime/calls/meeting%3A7/permit', ['user' => '43', 'publish' => false]],
+            ['/wordplus/realtime/calls/meeting%3A7/spotlight', ['user' => '43', 'on' => true]],
+            ['/wordplus/realtime/calls/meeting%3A7/spotlight', ['user' => '43', 'on' => false]],
+            ['/wordplus/realtime/calls/meeting%3A7/spotlight', ['on' => false]],
+        ], array_map(static fn (array $s) => [$s['path'], $s['body']], $this->sent));
+    }
+
+    public function testSomeoneLeavesAStreamAsARoomOrACallAndKickStillDoesIt(): void
+    {
+        $realtime = $this->app();
+
+        $realtime->stream('show:1')->remove(7);
+        $realtime->stream('show:1')->kick(8);
+
+        $this->assertSame([
+            ['/wordplus/realtime/streams/show%3A1/kick', ['user' => '7']],
+            ['/wordplus/realtime/streams/show%3A1/kick', ['user' => '8']],
+        ], array_map(static fn (array $s) => [$s['path'], $s['body']], $this->sent));
+    }
+
+    public function testANameNoRuleOwnsIsSaidOnceInTheLogAndRefusedAsEver(): void
+    {
+        $log = tempnam(sys_get_temp_dir(), 'wordplus-log');
+        $before = ini_set('error_log', $log);
+
+        try {
+            $realtime = $this->app();
+            $this->assertSame(['nothing:1' => 'no_rule'], (array) $realtime->authorize(['nothing:1'], 42)['denied']);
+            $realtime->authorize(['nothing:1'], 43);
+            $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['call' => 'nothing:1', 'id' => 'attempt-1', 'role' => 'caller', 'to' => 43], 42));
+            $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['room' => 'nothing:1'], 42));
+            $this->assertSame(['denied' => 'forbidden'], $realtime->authorizeCall(['stream' => 'nothing:1'], 42));
+
+            $said = (string) file_get_contents($log);
+            $this->assertSame(1, substr_count($said, '$realtime->room('));
+            $this->assertSame(1, substr_count($said, '$realtime->callToken('));
+            $this->assertSame(1, substr_count($said, '$realtime->groupCallToken('));
+            $this->assertSame(1, substr_count($said, '$realtime->streamToken('));
+            $this->assertStringContainsString('"nothing:1"', $said);
+
+            for ($i = 0; $i < 40; ++$i) {
+                $realtime->authorize(['other:'.$i], 42);
+            }
+            $this->assertSame(20, substr_count((string) file_get_contents($log), 'no rule matches'));
+        } finally {
+            ini_set('error_log', (string) $before);
+            unlink($log);
+        }
+    }
+
+    public function testAUserARuleTurnedAwaySaysNothingInTheLog(): void
+    {
+        $log = tempnam(sys_get_temp_dir(), 'wordplus-log');
+        $before = ini_set('error_log', $log);
+
+        try {
+            $realtime = $this->app();
+            $realtime->room('order:{id}', static fn () => false);
+
+            $this->assertSame(['order:1' => 'forbidden'], (array) $realtime->authorize(['order:1'], 42)['denied']);
+            $this->assertSame('', (string) file_get_contents($log));
+        } finally {
+            ini_set('error_log', (string) $before);
+            unlink($log);
+        }
     }
 }

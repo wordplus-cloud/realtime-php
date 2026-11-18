@@ -101,9 +101,15 @@ final class StreamQueries
     }
 
     /** Out of the stream now, free to come back. Throws `host` for a host. */
-    public function kick(int|string $user): void
+    public function remove(int|string $user): void
     {
         $this->realtime->request('POST', $this->path.'/kick', ['user' => (string) $user]);
+    }
+
+    /** The same as `remove()`. */
+    public function kick(int|string $user): void
+    {
+        $this->remove($user);
     }
 
     /** Out of the stream until it is lifted. Throws `host` for a host. */

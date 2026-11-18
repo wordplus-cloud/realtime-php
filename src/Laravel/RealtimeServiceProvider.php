@@ -30,6 +30,9 @@ final class RealtimeServiceProvider extends ServiceProvider
     /** @var (callable(int|string): bool)|null */
     private static $hidden = null;
 
+    /** @var (callable(int|string): bool)|null */
+    private static $hasKeys = null;
+
     /** How the app's users look to each other: `fn ( $id ) => [ 'name' => …, 'avatar' => … ]`, or null for nobody. */
     public static function profileUsing(?callable $profile): void
     {
@@ -40,6 +43,12 @@ final class RealtimeServiceProvider extends ServiceProvider
     public static function hiddenUsing(?callable $hidden): void
     {
         self::$hidden = $hidden;
+    }
+
+    /** Who may have keys, such as false for a user the app cut off: `fn ( $id ) => (bool) …`. Everyone by default. */
+    public static function hasKeysUsing(?callable $hasKeys): void
+    {
+        self::$hasKeys = $hasKeys;
     }
 
     public function register(): void
@@ -57,7 +66,8 @@ final class RealtimeServiceProvider extends ServiceProvider
             $store = $config['generations'] ?? null;
 
             $realtime = new Realtime(array_filter([
-                'site' => (string) ($config['site'] ?? ''),
+                // `app` in a config published since, `site` in one published before.
+                'site' => (string) ($config['app'] ?? $config['site'] ?? ''),
                 'secret' => (string) ($config['secret'] ?? ''),
                 'local_key' => (string) ($config['local_key'] ?? ''),
                 'base' => '/'.trim((string) ($config['routes']['prefix'] ?? 'wordplus/realtime'), '/'),
@@ -65,6 +75,11 @@ final class RealtimeServiceProvider extends ServiceProvider
                 'files' => false !== ($config['files'] ?? true),
                 'worker' => $config['worker'] ?? null,
                 'rooms' => $config['rooms'] ?? null,
+                'rooms_worker' => $config['rooms_worker'] ?? null,
+                'headers' => empty($config['headers']) ? null : (array) $config['headers'],
+                'token_ttl' => isset($config['token_ttl']) ? (int) $config['token_ttl'] : null,
+                'call_token_ttl' => isset($config['call_token_ttl']) ? (int) $config['call_token_ttl'] : null,
+                'has_keys' => static fn ($id) => null === self::$hasKeys || (bool) (self::$hasKeys)($id),
                 'seal' => (bool) ($config['seal'] ?? true),
                 'server' => $config['server'] ?? null,
                 'api' => $config['api'] ?? null,

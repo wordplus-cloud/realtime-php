@@ -17,7 +17,7 @@ Laravel can run websockets of its own. [Why WordPlus Cloud](https://docs.wordplu
 
 ## 1. Your app in WordPlus Cloud
 
-**Apps are in early access.** Ask for it on our [contact form](https://www.wordplus.cloud/contact), and we turn **Apps** on in your WordPlus Cloud account. Until then your account has no Apps page.
+**Apps come with a subscription.** [Choose your connections](https://www.wordplus.cloud/pricing#apps), starting from 1,000, and your WordPlus Cloud account gets its **Apps** page.
 
 In your WordPlus Cloud account, go to **Apps → Add app**. Name it, and list the addresses its pages are served from: `https://shop.example.com`, and `http://localhost:8000` while you develop. Only pages on those addresses may connect.
 
@@ -30,6 +30,10 @@ WORDPLUS_SECRET=…
 WORDPLUS_LOCAL_KEY=…              # openssl rand -hex 32; the same on every server of the app, kept as long as the app
 ```
 
+Once the package is installed, its command writes the last three for you, with a local key it makes, and says whether your keys and routes work: `vendor/bin/wordplus-realtime init`, then `vendor/bin/wordplus-realtime check http://localhost:8000`.
+
+While you develop, `php artisan serve` answers one request at a time, which a page that asks your routes several things at once soon waits on. `PHP_CLI_SERVER_WORKERS=4 php artisan serve --no-reload` gives it four.
+
 ## 2. Install
 
 ```bash
@@ -41,7 +45,7 @@ Laravel finds the package by itself, and its routes serve the browser files: `GE
 
 The package brings the `wordplus` broadcasting connection, so `BROADCAST_CONNECTION=wordplus` is all `.env` needs, with no `config/broadcasting.php` of your own. Laravel 11 and later also leave out `routes/channels.php`: make it, with `<?php` and `use Illuminate\Support\Facades\Broadcast;` at its top, and name it in `bootstrap/app.php`:
 
-```php
+```php fragment
 // bootstrap/app.php
 ->withRouting(
     web: __DIR__ . '/../routes/web.php',
@@ -52,11 +56,22 @@ The package brings the `wordplus` broadcasting connection, so `BROADCAST_CONNECT
 
 Skip `php artisan install:broadcasting` here. It asks for Reverb, Pusher, Ably or Mercure, writes that one into `.env` in place of `wordplus`, and adds Echo to `resources/js`.
 
-## 3. Your rooms
+## 3. Your server
+
+Each room is named after what it carries: `orders.1042` for the updates of order 1042. A page that joins it asks your app first, and a rule answers: the callback of the channel in `routes/channels.php` whose pattern fits, here `orders.{order}`. WordPlus Cloud then holds the page to the answer ([permissions](https://docs.wordplus.cloud/apps/permissions/)). This rule says:
+
+1. **Visitors** who are not signed in stay out: a visitor never reaches the callback of a channel.
+2. **The customer of the order** joins, and nobody else.
+
+And the room keeps its last 20 updates, for a page that reconnects.
 
 ```php
-// routes/channels.php: the room of an order, orders.1042, for its customer, the last 20 updates kept.
-Broadcast::channel( 'orders.{order}', fn ( User $user, Order $order ) => $user->id === $order->customer_id, [ 'history' => 20 ] );
+// routes/channels.php: the room of an order, orders.1042, the last 20 updates kept.
+Broadcast::channel( 'orders.{order}', function ( User $user, Order $order ) {
+    // 1. A visitor never gets here.
+    // 2. The customer of the order, and nobody else.
+    return $user->id === $order->customer_id;
+}, [ 'history' => 20 ] );
 ```
 
 Each channel is a room of the same name. A `PrivateChannel( 'orders.1042' )` is the room `orders.1042`, and the third argument says what the room keeps and allows ([rooms](rooms.md)).
@@ -94,7 +109,7 @@ Echo.private( 'orders.1042' )
 - **Livewire** hears them the same way: `#[On( 'echo-private:orders.{order.id},.updated' )]`.
 - **React and Vue:** `configureEcho( { broadcaster: WordplusConnector, ...window.wordplusRealtimeConfig } )` from `@laravel/echo-react` or `@laravel/echo-vue`, then `useEcho()` as Laravel's starter kits do.
 - **`toOthers()`** skips the tab that asked, sent as `X-Socket-ID`. Echo's request interceptors add it to axios once it is on `window` (`window.axios = axios`, which Laravel 11 and later leave out), and to Vue's and jQuery's. With `fetch()`, add it yourself: `headers: { 'X-Socket-ID': Echo.socketId() }`.
-- **Calls, live streams, the ready-made chat and who is online** come from `@wordplus/realtime` itself, on the connection Echo made: `window.Echo.connector.rt`. Or connect first, and hand Echo the connection: `const rt = await connect( window.wordplusRealtimeConfig )`, then `new Echo( { broadcaster: WordplusConnector, realtime: rt } )`.
+- **Calls, live streams, the ready-made conversation window (`<chat-room>`) and who is online** come from `@wordplus/realtime` itself, on the connection Echo made: `window.Echo.connector.rt`. Or connect first, and hand Echo the connection: `const rt = await connect( window.wordplusRealtimeConfig )`, then `new Echo( { broadcaster: WordplusConnector, realtime: rt } )`.
 
 ## 5. Send
 
@@ -140,7 +155,9 @@ Everyone in the room gets `{ status }`, sealed with the room key on the way, and
 | `routes.middleware` | `['web']` | how the routes know the user |
 | `routes.enabled` | `true` | `false` to register `RealtimeController` yourself |
 | `files` | `true` | the routes serve the browser files. `false`, with `worker` and `rooms`, for files your app serves itself |
-| `worker`, `rooms` | `null` | where your app serves the worker and the room client itself |
+| `worker`, `rooms`, `rooms_worker` | `null` | where your app serves the worker, the room client and its encryption worker itself |
+| `headers` | `[]` | headers each request of the browser to the routes carries |
+| `token_ttl`, `call_token_ttl` | `null` | how long the tokens of rooms and of calls last, in seconds: 6 hours unless set |
 | `generations` | `WORDPLUS_REALTIME_GENERATIONS` | the cache store for moving keys on |
 | `seal` | `true` | `false` sends everything plain |
 | `broadcasting` | `wordplus` | the connection whose `routes/channels.php` declares the rooms |
@@ -148,9 +165,13 @@ Everyone in the room gets `{ status }`, sealed with the room key on the way, and
 
 ## Next
 
-- [Rooms](rooms.md), [presence and who is online](presence.md), [sending from your server](sending.md) and [events from the page](events.md), with the ready-made chat
-- [Calls and group calls](calls.md), with the call screen
+- [Rooms](rooms.md), [presence and who is online](presence.md), [sending from your server](sending.md) and [events from the page](events.md), with the ready-made conversation window (`<chat-room>`)
+- [Calls and group calls](calls.md), with the call screen, and [live streams](streams.md)
 - [Encryption and your users](encryption.md)
 - [Customizing the screens](customizing.md): their look, a piece of your own, or their whole code
 - [Deploying](deploying.md), and [the example app](example.md)
 - The [PHP reference](../reference.md), the [browser reference](https://docs.wordplus.cloud/apps/browser/), [errors](https://docs.wordplus.cloud/apps/errors/) and [limits](https://docs.wordplus.cloud/apps/limits/)
+
+## What to build next
+
+Each use case is a page of its own, with the rules of your server and the code of the page: [chat](https://docs.wordplus.cloud/use-cases/chat/), [who is online](https://docs.wordplus.cloud/use-cases/online/), [live updates and notifications](https://docs.wordplus.cloud/use-cases/live-updates/), [calls from a button](https://docs.wordplus.cloud/use-cases/support-calls/), [team meetings](https://docs.wordplus.cloud/use-cases/meetings/), [live streaming](https://docs.wordplus.cloud/use-cases/live-streaming/) and the rest in the [use cases](https://docs.wordplus.cloud/use-cases/overview/). Three of them build a small Node.js app from an empty folder, every file in full.

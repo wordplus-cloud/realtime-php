@@ -27,6 +27,20 @@ final class UserQueries
     }
 
     /**
+     * Sends to every connection they have open, as `toUser( $id )->emit()` does: a page hears it with `rt.on( event )`.
+     *
+     * @param array{seal?: bool, except?: ?string} $options
+     *
+     * @return array<string, string>
+     *
+     * @throws RealtimeError the server's reason
+     */
+    public function emit(string $event, mixed $data = null, array $options = []): array
+    {
+        return $this->realtime->toUser($this->id)->emit($event, $data, $options);
+    }
+
+    /**
      * Takes the user out of everything at once: every room, their identity, their lines, group calls and live streams (a
      * host stays). Their pages then ask your routes again, and the tokens signed before are refused, so your rules decide
      * whether they come back: a user you signed out or blocked does not.

@@ -30,7 +30,15 @@ class ShopController extends Controller
                 'order' => ['id' => $order->id, 'number' => 1042, 'customer' => $order->customer_id, 'item' => $order->item, 'status' => $order->status],
                 'chat' => ['between' => [$s * 100 + 34, $s * 100 + 42]],
                 'product' => ['name' => $order->item, 'picture' => '/products/mugs.webp'],
-                'routes' => ['status' => route('orders.status', $order), 'wire' => route('orders.wire', $order), 'messages' => route('chat.messages')],
+                'routes' => [
+                    'status' => route('orders.status', $order),
+                    'wire' => route('orders.wire', $order),
+                    'messages' => route('chat.messages'),
+                    // The routes that start a call, the meeting and the show, each with the id of the shop's own.
+                    'callToken' => route('tokens.call'),
+                    'meetingToken' => route('tokens.meeting', ['id' => explode(':', Shop::rooms($s)['meeting'], 2)[1]]),
+                    'showToken' => route('tokens.show', ['id' => explode(':', Shop::rooms($s)['show'], 2)[1]]),
+                ],
                 'rooms' => Shop::rooms($s),
                 'events' => ['order' => 'updated', 'chat' => 'message'],
                 'headers' => ['X-CSRF-TOKEN' => csrf_token()],

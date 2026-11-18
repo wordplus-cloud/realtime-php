@@ -25,7 +25,14 @@ namespace WordPlus\Realtime;
  */
 final class Realtime
 {
-    public const VERSION = '1.0.2';
+    public const VERSION = '1.1.0';
+
+    /**
+     * Held for now: RECORDING_AVAILABLE is false until WordPlus Cloud serves the recordings routes for apps. While it is
+     * false a group call's answer never says `record: true`, so no call screen offers Start Recording. Set it to true to
+     * turn it back on.
+     */
+    public static bool $recordingAvailable = false;
 
     /** The largest id of digits a page reads as the same number (JavaScript's Number.MAX_SAFE_INTEGER). */
     private const MAX_SAFE_INTEGER = 9007199254740991;
@@ -89,17 +96,30 @@ final class Realtime
     public const GRANT_AUDIENCE = 'easy-stream';
 
     /** What a host does to someone else in a group call from its call screen: the calls route's `moderate`. */
-    public const MODERATION_ACTS = ['mute', 'speak', 'listen', 'remove'];
+    public const MODERATION_ACTS = ['mute', 'speak', 'listen', 'remove', 'spotlight', 'unspotlight', 'ban', 'unban', 'hold_mic', 'release_mic', 'rules', 'ask', 'end'];
 
-    public const CLAIM_ORDER = ['iss', 'aud', 'str', 'role', 'sub', 'name', 'avatar', 'chat', 'mod', 'src', 'q', 'stage', 'offline', 'links', 'fresh', 'people', 'reactions', 'org', 'iat', 'exp'];
+    /**
+     * What a group call's screen may offer, as this package takes it (`acts` in groupCallToken()'s token and in the room's
+     * answer): the call screen shows a control only for an act both this package and the realtime server name. `hand` is
+     * raising hands, for everyone; the rest are a host's. Recording is not one of them.
+     */
+    public const CALL_ACTS = ['remove', 'ban', 'listen', 'speak', 'mute', 'hold_mic', 'release_mic', 'rules', 'hand', 'ask', 'end', 'spotlight'];
+
+    /** The longest ban, in minutes: a week. */
+    public const BAN_MOST_MINUTES = 10080;
+
+    /** The cloud's refusals of a host's act that its call screen says in its own words; any other is `server`. */
+    private const PASSED_ON = ['spotlight_full', 'forbidden', 'asked_recently', 'not_in_call', 'bad_request'];
+
+    public const CLAIM_ORDER = ['iss', 'aud', 'str', 'role', 'sub', 'name', 'avatar', 'chat', 'mod', 'src', 'q', 'stage', 'offline', 'links', 'fresh', 'people', 'reactions', 'org', 'iat', 'ms', 'exp'];
 
     /** A stream's grant lives ten minutes, as Easy Stream's do; the page asks for another as one runs out. */
     public const STREAM_TTL = 600;
 
     /** A live stream's name: a room's without an underscore, as the cloud takes it in a grant's `str`. */
-    private const STREAM_NAME = '/^[A-Za-z0-9\-=@,.;:]{1,128}$/';
+    private const STREAM_NAME = '/^[A-Za-z0-9\-=@,.;:]{1,128}$/D';
 
-    private const STREAM_USER = '/^[\w.@-]{1,64}$/';
+    private const STREAM_USER = '/^[\w.@-]{1,64}$/D';
 
     private readonly string $site;
 
@@ -132,9 +152,12 @@ final class Realtime
 
     private bool $warnedUser = false;
 
+    /** @var array<string, true> */
+    private array $warnedNoRule = [];
+
     /**
      * @param array{
-     *     site: string, secret: string, local_key: string,
+     *     app?: string, site?: string, secret: string, local_key: string,
      *     profile?: callable(int|string): (array<string, mixed>|null),
      *     has_keys?: callable(int|string): bool,
      *     hidden?: callable(int|string): bool,
@@ -148,12 +171,13 @@ final class Realtime
      */
     public function __construct(private array $options)
     {
-        $this->site = (string) ($options['site'] ?? '');
+        // `app` is its name, `site` the same in its old word.
+        $this->site = (string) ($options['app'] ?? $options['site'] ?? '');
         $this->secret = (string) ($options['secret'] ?? '');
         $this->localKey = (string) ($options['local_key'] ?? '');
 
         if ('' === $this->site || '' === $this->secret) {
-            throw new \InvalidArgumentException('wordplus-realtime: site and secret are required (WORDPLUS_SITE, WORDPLUS_SECRET)');
+            throw new \InvalidArgumentException('wordplus-realtime: the app key and secret are required: WORDPLUS_SITE and WORDPLUS_SECRET in the environment, or `app` and `secret`');
         }
 
         $this->keys = new Keys($this->localKey, $options['generations'] ?? null);
@@ -180,6 +204,13 @@ final class Realtime
         return $this->keys;
     }
 
+    /** The app's key: public, as every page carries it. */
+    public function app(): string
+    {
+        return $this->site;
+    }
+
+    /** The same as app(), in its old word. */
     public function site(): string
     {
         return $this->site;
@@ -188,14 +219,27 @@ final class Realtime
     /**
      * Rooms the app owns, by pattern (`order:{id}`), who may join, and what they are: `$rule( $user, $params, $room )`
      * answers false, true, or `[ 'info' => …, 'emit' => …, 'readOnly' => … ]` for that user. `$options`: `presence`,
-     * `count`, `history` (a number, or `[ 'last' => …, 'days' => … ]`), `emit` and `webhook` (names, or '*'), `public`,
+     * `count`, `history` (a number, or `[ 'last' => …, 'seconds' => … ]`), `emit` and `webhook` (names, or '*'), `public`,
      * `seal`. A public room may have no rule: anyone joins. The rule with the most characters of its own decides.
      *
+     * `chat:{pair}` is a room of the two people its name holds, `chat:34:42`, and nobody else: it needs no rule, and a
+     * rule it has is asked only about those two, with `other` the other one among `$params`.
+     *
+     * With only a name, `room( 'chat:7' )`, it is that one room as the realtime server holds it: its members, count and
+     * history, sending to it, and taking someone out of it.
+     *
      * @param array<string, mixed> $options
+     * @return ($rule is null ? ($options is array{} ? self|RoomQueries : self) : self)
      */
-    public function room(string $pattern, ?callable $rule = null, array $options = []): self
+    public function room(string $pattern, ?callable $rule = null, array $options = []): self|RoomQueries
     {
-        if (empty($options['public']) && null === $rule) {
+        if (null === $rule && [] === $options && !str_contains($pattern, '{')) {
+            return new RoomQueries($this, $pattern);
+        }
+
+        $pair = Patterns::hasPair($pattern);
+
+        if (empty($options['public']) && null === $rule && !$pair) {
             throw new \InvalidArgumentException('wordplus-realtime: room '.json_encode($pattern).' needs a rule, or `public`');
         }
 
@@ -203,10 +247,40 @@ final class Realtime
             throw new \InvalidArgumentException('wordplus-realtime: a public room has no members to list; take `presence` off '.json_encode($pattern));
         }
 
-        $this->rules->add($pattern, ['options' => self::normalized($options), 'rule' => $rule]);
+        if ($pair && !empty($options['public'])) {
+            throw new \InvalidArgumentException('wordplus-realtime: a public room is for anyone, not two people; take `{pair}` off '.json_encode($pattern));
+        }
+
+        $this->rules->add($pattern, ['options' => self::normalized($options), 'rule' => $pair ? self::pairRoomRule($rule) : $rule]);
         $this->publicGrant = null;
 
         return $this;
+    }
+
+    /** The rule of a `{pair}` room: the two in its name and nobody else, then the app's own rule if it has one, told who the other is. */
+    private static function pairRoomRule(?callable $rule): callable
+    {
+        return static function (int|string|null $user, array $params, string $room) use ($rule) {
+            $other = Patterns::otherOf($params['pair'], $user);
+
+            if (null === $other) {
+                return false;
+            }
+
+            return null === $rule ? true : $rule($user, $params + ['other' => $other], $room);
+        };
+    }
+
+    /** The rule of a `{pair}` call: both of the two in its name and nobody else, then the app's own rule if it has one. */
+    private static function pairCallRule(?callable $rule): callable
+    {
+        return static function (int|string $user, int|string $withUser, array $params, string $call, array $side) use ($rule) {
+            if (Patterns::otherOf($params['pair'], $user) !== (string) $withUser) {
+                return false;
+            }
+
+            return null === $rule ? true : $rule($user, $withUser, $params, $call, $side);
+        };
     }
 
     /**
@@ -223,7 +297,8 @@ final class Realtime
 
     /**
      * Calls between two people the app owns, by pattern (`support:{a}:{b}`): `$rule( $user, $withUser, $params, $call,
-     * $side )` answers false, true, or `[ 'info', 'publish', 'subscribe', 'admin', 'hidden' ]`. It is asked as the caller
+     * $side )` answers false, true, or `[ 'info' => … ]`, what the other side sees of them (a group call's rule alone takes
+     * `publish`, `subscribe`, `admin` and `hidden`, groupCalls()). It is asked as the caller
      * places the call (`$side['role']` `caller`) and again as the callee answers (`callee`), so a rule may let someone
      * answer calls they may not place.
      *
@@ -232,11 +307,25 @@ final class Realtime
      * encrypted end to end with a key only this server gives out, to the people in the call. `$options['people']`
      * (`fn ( $user, $call )`) lists the user ids the call screen offers to add.
      *
+     * `support:{pair}` is a call of the two people its name holds, `support:34:42`, and nobody else, which the page's
+     * `support:{pair}` names. It needs no rule, and a rule it has is asked only about those two. Being only ever those
+     * two, it takes no `people`.
+     *
      * @param array{people?: callable(int, string): array<int|string>} $options
      */
-    public function calls(string $pattern, callable $rule, array $options = []): self
+    public function calls(string $pattern, ?callable $rule = null, array $options = []): self
     {
-        $this->callRules->add($pattern, ['rule' => $rule, 'people' => isset($options['people']) && is_callable($options['people']) ? $options['people'] : null]);
+        $pair = Patterns::hasPair($pattern);
+
+        if (null === $rule && !$pair) {
+            throw new \InvalidArgumentException('wordplus-realtime: calls '.json_encode($pattern).' needs a rule');
+        }
+
+        if ($pair && isset($options['people'])) {
+            throw new \InvalidArgumentException('wordplus-realtime: a call of `{pair}` is only ever those two; `people` needs a rule of your own, for '.json_encode($pattern));
+        }
+
+        $this->callRules->add($pattern, ['rule' => $pair ? self::pairCallRule($rule) : $rule, 'people' => isset($options['people']) && is_callable($options['people']) ? $options['people'] : null]);
 
         return $this;
     }
@@ -249,6 +338,10 @@ final class Realtime
      */
     public function groupCalls(string $pattern, callable $rule, array $options = []): self
     {
+        if (Patterns::hasPair($pattern)) {
+            throw new \InvalidArgumentException('wordplus-realtime: `{pair}` is for rooms and calls of two people, not a group call: '.json_encode($pattern));
+        }
+
         $this->groupRules->add($pattern, ['rule' => $rule, 'encrypt' => !empty($options['encrypt'])]);
 
         return $this;
@@ -266,6 +359,10 @@ final class Realtime
      */
     public function streams(string $pattern, callable $rule, array $settings = []): self
     {
+        if (Patterns::hasPair($pattern)) {
+            throw new \InvalidArgumentException('wordplus-realtime: `{pair}` is for rooms and calls of two people, not a live stream: '.json_encode($pattern));
+        }
+
         $this->streamRules->add($pattern, ['rule' => $rule, 'settings' => $settings]);
 
         return $this;
@@ -278,7 +375,7 @@ final class Realtime
      */
     public function kind(string $kind, callable $mayHave, ?callable $newest = null): self
     {
-        if (1 === preg_match('/^[a-z][a-z0-9]{0,15}$/', $kind) && !in_array($kind, Keys::RESERVED, true)) {
+        if (1 === preg_match('/^[a-z][a-z0-9]{0,15}$/D', $kind) && !in_array($kind, Keys::RESERVED, true)) {
             $this->kinds[$kind] = [$mayHave, $newest];
         }
 
@@ -289,7 +386,8 @@ final class Realtime
      * A webhook from the realtime server, opened: `room.occupied`, `room.vacated`, `member.joined`, `member.left`,
      * `user.online`, `user.offline`, `stream.live`, `stream.ended` (a live stream going live and ending, its name in
      * `stream`), what people used (`call.ended`, `group.joined`, `group.left`, `stream.joined`, `stream.left`, with
-     * `seconds` once over), the name of a browser's event a room's rule sends here (`webhook`), or '*'.
+     * `seconds` once over), a host's or your server's act in a group call (`call.moderated`: `call`, `act`, `user`, `by`,
+     * `held`, a ban's `minutes`, the `rules`), the name of a browser's event a room's rule sends here (`webhook`), or '*'.
      */
     public function on(string $type, callable $handler): self
     {
@@ -310,7 +408,17 @@ final class Realtime
         return (new Emitter($this))->toUser($users);
     }
 
-    /** A room as the realtime server holds it: its members, count, history, and kicking a user out. */
+    /**
+     * An emit to every page and app connected now, signed in or not, with no room to join:
+     * `$realtime->toEveryone()->emit( 'notice', $data )`. A page hears it with `rt.on( 'notice', … )`. Anyone may be connected,
+     * so it is never sealed: keep it to what anyone may read.
+     */
+    public function toEveryone(): EveryoneEmitter
+    {
+        return new EveryoneEmitter($this);
+    }
+
+    /** @deprecated `room( $name )`. */
     public function in(string $room): RoomQueries
     {
         return new RoomQueries($this, $room);
@@ -366,6 +474,12 @@ final class Realtime
     public function webhooks(): WebhookQueries
     {
         return new WebhookQueries($this);
+    }
+
+    /** Recordings of the app's group calls and live streams, with their transcripts. */
+    public function recordings(): RecordingQueries
+    {
+        return new RecordingQueries($this);
     }
 
     /**
@@ -444,6 +558,7 @@ final class Realtime
 
             if (null === $entry) {
                 $denied[$room] = 'no_rule';
+                $this->warnNoRule('room', $room);
 
                 continue;
             }
@@ -478,7 +593,10 @@ final class Realtime
 
         $now = $this->now();
         $exp = $now + self::clamp((int) ($this->options['token_ttl'] ?? self::TOKEN_TTL), 60, self::MAX_TTL);
-        $claims = ['iss' => $this->site, 'aud' => self::AUDIENCE, 'iat' => $now, 'exp' => $exp];
+        // `ms`, so a token signed right after someone was taken out of a room works, in the same second too. Only within
+        // `iat`, as a clock given in the options, or the second turning just now, may say another.
+        $ms = (int) floor(microtime(true) * 1000);
+        $claims = ['iss' => $this->site, 'aud' => self::AUDIENCE, 'iat' => $now, 'ms' => intdiv($ms, 1000) === $now ? $ms : $now * 1000, 'exp' => $exp];
 
         if (self::known($user)) {
             $claims['sub'] = (string) $user;
@@ -616,7 +734,16 @@ final class Realtime
         }
 
         if (array_key_exists('moderate', $request)) {
-            return $this->moderateCall($request['moderate'], $request['act'] ?? null, $request['user'] ?? null, $me);
+            return $this->moderateCall($request['moderate'], $request['act'] ?? null, $request['user'] ?? null, $me, $request['host'] ?? null, $request);
+        }
+
+        if (array_key_exists('hand', $request)) {
+            // No `user` is one's own hand; a `user`, null too, is a host lowering hands.
+            return $this->handInCall($request['hand'], $request['up'] ?? null, array_key_exists('user', $request), $request['user'] ?? null, $me, $request['host'] ?? null, $request['member'] ?? null);
+        }
+
+        if (array_key_exists('record', $request)) {
+            return $this->recordCall($request['call'] ?? null, $request['record'], $request['recording'] ?? null, $me, $request['recorder'] ?? null);
         }
 
         $type = isset($request['type']) && 'audio' === $request['type'] ? 'audio' : 'video';
@@ -629,6 +756,11 @@ final class Realtime
             }
 
             $found = $this->groupRules->match($room);
+
+            if (null === $found) {
+                $this->warnNoRule('groupCalls', $room);
+            }
+
             $answer = null === $found ? null : $this->callAnswer(($found['value']['rule'])($me, $found['params'], $room), $me);
 
             if (null === $answer) {
@@ -650,6 +782,17 @@ final class Realtime
             // Encrypted end to end when its rule says so: everyone the rule lets in gets the room's key.
             if ($found['value']['encrypt']) {
                 $signed['media_key'] = $this->keys->media('room|'.$room);
+            }
+
+            // Who the call screen offers Record to, as recordCall() asks the rule again.
+            if (isset($signed['token']) && !empty($answer['record'] ?? $answer['admin'] ?? false)) {
+                // Held: RECORDING_AVAILABLE is false until WordPlus Cloud serves the recordings routes, so no screen offers Record.
+                $signed['record'] = self::$recordingAvailable;
+            }
+
+            // The acts this package takes, which the call screen offers where the realtime server takes them too.
+            if (isset($signed['token'])) {
+                $signed['acts'] = self::CALL_ACTS;
             }
 
             return $signed;
@@ -674,7 +817,7 @@ final class Realtime
             return ['denied' => 'bad_request'];
         }
 
-        $answer = $this->askCaller($me, $call, $other, $role);
+        $answer = $this->askCaller($me, $call, $other, $role, $this->provenSide($request, $call, $id, $role, $other, $me));
 
         if (null === $answer) {
             return ['denied' => 'forbidden'];
@@ -724,6 +867,219 @@ final class Realtime
         return $signed;
     }
 
+    /**
+     * A token that lets `$user` call `$to`, for your own route to give their page: `rt.startCall( token )`. Your app decides
+     * who may call whom, so check whatever it needs first: this signs what it's asked to. The person called needs no token
+     * of their own to answer, as this one's ring proves that your server said yes. It rings once, so make a new one for each call.
+     *
+     * @param array{type?: ?string, name?: string, info?: array<string, mixed>, into?: string} $options `type`, `audio`, or `video`
+     *        for anything else; `name`, of your own for the call, which `call.ended` and the other webhooks give back; `info`, what
+     *        the person called is told about the caller, your `profile` by default; `into`, to ring `$to` into a call this user
+     *        is in, the `call.ref` their page sent your route, and the call goes on as a group call
+     */
+    public function callToken(int|string $user, int|string $to, array $options = []): string
+    {
+        $me = self::callUser($user);
+        $other = self::callUser($to);
+
+        if (null === $me || null === $other || $me === $other) {
+            throw new \InvalidArgumentException('wordplus-realtime: callToken needs two different users, each an id of up to 64 characters with no space');
+        }
+
+        $id = Keys::base64url(random_bytes(15));
+        $info = array_key_exists('info', $options) ? $options['info'] : $this->defaultInfo($me);
+
+        if (isset($options['into'])) {
+            return $this->addToCallToken($me, $other, $id, $options['into'], $info);
+        }
+
+        $call = $options['name'] ?? 'call:'.$id;
+
+        if (!Patterns::validRoom($call)) {
+            throw new \InvalidArgumentException('wordplus-realtime: '.Json::encode($call).' is not a name a call can have');
+        }
+
+        $pair = [$me, $other];
+        $type = 'audio' === ($options['type'] ?? null) ? 'audio' : 'video';
+        $ring = $this->callProof('rung', $call, $id, $pair, $other);
+        $signed = $this->signCalls(['aud' => self::CALL_AUDIENCE, 'call' => $call, 'id' => $id, 'sub' => $me, 'role' => 'caller', 'type' => $type, 'to' => $other, 'info' => $this->sealedCallInfo(['_ring' => $ring] + (array) ($info ?? []))]);
+
+        return Keys::base64url(Json::encode([
+            'token' => $signed['token'],
+            'exp' => $signed['exp'],
+            'call' => $call,
+            'id' => $id,
+            'to' => $other,
+            'type' => $type,
+            'key' => $this->callKey($id, $me, $other),
+            'media_key' => $this->keys->media('call|'.$call.'|'.$id.'|'.self::idPart($me).'|'.self::idPart($other)),
+            'pair' => $pair,
+            'member' => $this->callProof('member', $call, $id, $pair, $me),
+        ]));
+    }
+
+    /** The token that rings `$other` into the call `$into` names, which this user must be in: only this server makes that proof. */
+    private function addToCallToken(int|string $me, int|string $other, string $id, string $into, mixed $info): string
+    {
+        $ref = json_decode((string) base64_decode(strtr($into, '-_', '+/')), true);
+        $pair = is_array($ref) ? self::pairOf($ref['pair'] ?? null) : null;
+        $name = $ref['name'] ?? null;
+        $group = $ref['id'] ?? null;
+        $member = $ref['member'] ?? null;
+
+        if (null === $pair || !Patterns::validRoom($name) || !self::validAttempt($group) || !is_string($member) || !hash_equals($this->callProof('member', $name, $group, $pair, $me), $member)) {
+            throw new \InvalidArgumentException('wordplus-realtime: callToken `into` must be the `call.ref` of a call this user is in');
+        }
+
+        $type = 'audio' === ($ref['type'] ?? null) ? 'audio' : 'video';
+        $signed = $this->signCalls(['aud' => self::CALL_AUDIENCE, 'call' => $name, 'id' => $id, 'sub' => $me, 'role' => 'caller', 'type' => $type, 'to' => $other, 'group' => $group, 'info' => $this->sealedCallInfo($info)]);
+
+        return Keys::base64url(Json::encode([
+            'token' => $signed['token'],
+            'exp' => $signed['exp'],
+            'call' => $name,
+            'id' => $id,
+            'to' => $other,
+            'type' => $type,
+            'group' => $group,
+            'pair' => $pair,
+            'member' => $member,
+            'ring' => $this->callProof('rung', $name, $group, $pair, $other),
+        ]));
+    }
+
+    /**
+     * A token that lets `$user` into the group call `$name`, for your own route to give their page: `rt.joinGroupCall( token )`.
+     * Your app decides who joins and what they may do, so check whatever it needs first. A call has no setup of its own: it
+     * starts as the first person joins, and `$options` say what this person may do in it. Someone taken out of the call
+     * needs a new token to come back, so your route is asked again.
+     *
+     * @param array{type?: ?string, publish?: bool, subscribe?: bool, admin?: bool, hidden?: bool, record?: bool, encrypt?: bool, info?: array<string, mixed>} $options
+     *        `type`, `audio`, or `video` for anything else; `publish` and `subscribe`, yes by default; `admin`, hosts the call; `hidden`, listed to
+     *        nobody; `record`, may record it, as its host may unless this says no; `encrypt`, end to end, with a key only your server gives out;
+     *        `info`, what the others are told about this user, your `profile` by default
+     */
+    public function groupCallToken(int|string $user, string $name, array $options = []): string
+    {
+        $me = self::callUser($user);
+
+        if (null === $me) {
+            throw new \InvalidArgumentException('wordplus-realtime: groupCallToken needs a user, an id of up to 64 characters with no space');
+        }
+
+        if (!Patterns::validRoom($name)) {
+            throw new \InvalidArgumentException('wordplus-realtime: '.Json::encode($name).' is not a name a call can have');
+        }
+
+        $type = 'audio' === ($options['type'] ?? null) ? 'audio' : 'video';
+        $info = array_key_exists('info', $options) ? $options['info'] : $this->defaultInfo($me);
+        $admin = !empty($options['admin']);
+        $signed = $this->signCalls([
+            'aud' => self::ROOM_AUDIENCE,
+            'room' => $name,
+            'sub' => $me,
+            'type' => $type,
+            'info' => $this->sealedCallInfo($info),
+            'publish' => ($options['publish'] ?? true) !== false,
+            'subscribe' => ($options['subscribe'] ?? true) !== false,
+            'admin' => $admin,
+            'hidden' => !empty($options['hidden']),
+        ]);
+
+        $made = ['token' => $signed['token'], 'exp' => $signed['exp'], 'room' => $name, 'type' => $type, 'user' => $me];
+
+        if (!empty($options['encrypt'])) {
+            $made['media_key'] = $this->keys->media('room|'.$name);
+        }
+
+        // What the page shows for a host's acts and for recording, through the SDK's route: the call may outlast the token.
+        $until = $signed['exp'] + self::CALL_TTL;
+
+        if ($admin) {
+            $made['host'] = ['until' => $until, 'proof' => $this->groupProof('host', $name, $me, $until)];
+        }
+
+        // Held with the answer's record flag: no recorder proof while recording is unavailable (see $recordingAvailable).
+        if (self::$recordingAvailable && ($options['record'] ?? $admin)) {
+            $made['recorder'] = ['until' => $until, 'proof' => $this->groupProof('recorder', $name, $me, $until)];
+        }
+
+        // Everyone's proof of being in the call, for raising a hand through the SDK's route, and the acts this package takes.
+        $made['member'] = ['until' => $until, 'proof' => $this->groupProof('member', $name, $me, $until)];
+        $made['acts'] = self::CALL_ACTS;
+
+        return Keys::base64url(Json::encode($made));
+    }
+
+    /** A proof that a user hosts a group call, may record it, or is in it (`member`), until a time: only this server makes one. */
+    private function groupProof(string $kind, string $name, int|string $user, int $until): string
+    {
+        // Four parts, never the six of callProof()'s: neither a name nor an escaped user holds a `|`.
+        return $this->keys->proof($kind.'|'.$name.'|'.self::idPart($user).'|'.$until);
+    }
+
+    /** Whether what a page holds is that proof, still in time. */
+    private function holdsGroupProof(string $kind, string $name, int|string $user, mixed $held): bool
+    {
+        $proof = is_array($held) ? ($held['proof'] ?? null) : null;
+        $until = is_array($held) ? ($held['until'] ?? null) : null;
+
+        return is_string($proof) && is_int($until) && $until >= $this->now() && hash_equals($this->groupProof($kind, $name, $user, $until), $proof);
+    }
+
+    /**
+     * A token that lets `$user` into the live stream `$name`, for your own route to give their page: `rt.joinStream( getToken )`.
+     * `$user` is null for a visitor who isn't signed in, who can only be a viewer. Your app decides who is what, so check
+     * whatever it needs first. It lasts ten minutes, so the page asks your route again as it runs out, and your route may then say no.
+     *
+     * @param array{role?: 'host'|'guest'|'viewer', info?: array<string, mixed>|null, chat?: 'write'|'read', mod?: bool, src?: list<string>, quality?: string, settings?: array<string, mixed>} $options
+     *        `role`, `viewer` by default; `info`, a name and an https picture, your `profile` by default; `chat`; `mod`, moderates the chat;
+     *        `src`, what a host or guest may send; `quality`, a cap on the picture they send; `settings`, the stream's own, the same in every token for it
+     */
+    public function streamToken(int|string|null $user, string $name, array $options = []): string
+    {
+        if (1 !== preg_match(self::STREAM_NAME, $name)) {
+            throw new \InvalidArgumentException('wordplus-realtime: '.Json::encode($name).' is not a name a stream can have');
+        }
+
+        $settings = $options['settings'] ?? [];
+        unset($options['settings']);
+        $signed = $this->signStream($name, $user, $options + ['role' => 'viewer'], $settings, []);
+
+        if (!isset($signed['token'])) {
+            throw new \InvalidArgumentException('wordplus-realtime: streamToken: a visitor can only be a viewer, and a user is an id of up to 64 characters of letters, digits and _ . @ -');
+        }
+
+        return Keys::base64url(Json::encode(['token' => $signed['token'], 'exp' => $signed['exp'], 'name' => $name]));
+    }
+
+    /**
+     * Whether this side of a call holds what only this server makes, so it already said yes (callToken()): the person rung,
+     * with the proof the ring brought, or either side, with its proof of being in the call, for a token that ran out.
+     * Bringing someone new into a call is never proven: that is the app's to decide.
+     *
+     * @param array<string, mixed> $request
+     */
+    private function provenSide(array $request, string $call, string $id, string $role, int|string $other, int|string $me): bool
+    {
+        $ring = $request['ring'] ?? null;
+
+        if (null !== ($request['group'] ?? null)) {
+            $named = self::pairOf($request['pair'] ?? null);
+
+            return 'callee' === $role && is_string($ring) && null !== $named && hash_equals($this->callProof('rung', $call, $request['group'], $named, $me), $ring);
+        }
+
+        $pair = 'caller' === $role ? [$me, $other] : [$other, $me];
+        $member = $request['member'] ?? null;
+
+        if (is_string($member) && hash_equals($this->callProof('member', $call, $id, $pair, $me), $member)) {
+            return true;
+        }
+
+        return 'callee' === $role && is_string($ring) && hash_equals($this->callProof('rung', $call, $id, $pair, $me), $ring);
+    }
+
     /** The key a call's two browsers seal their negotiation with: made from the local key, which WordPlus Cloud doesn't know. */
     public function callKey(string $id, int|string $caller, int|string $callee): string
     {
@@ -742,7 +1098,8 @@ final class Realtime
             $keys = $this->userEntries($user);
             $identity = [] === $keys ? null : $this->identity($user);
 
-            return null === $identity ? ['keys' => $keys] : ['keys' => $keys, 'identity' => $identity];
+            // The app's key beside them, public as every page carries it: a browser has no environment to read it from.
+            return null === $identity ? ['keys' => $keys, 'app' => $this->site] : ['keys' => $keys, 'identity' => $identity, 'app' => $this->site];
         }
 
         $keys = [];
@@ -773,7 +1130,7 @@ final class Realtime
         [$kind, $rest] = explode(':', $label, 2);
 
         if ('d' === $kind) {
-            return self::known($user) && 1 === preg_match('/^\d{1,9}$/', $rest) && (int) $rest <= Keys::day() + 1;
+            return self::known($user) && 1 === preg_match('/^\d{1,9}$/D', $rest) && (int) $rest <= Keys::day() + 1;
         }
 
         if ('u' === $kind) {
@@ -781,7 +1138,7 @@ final class Realtime
         }
 
         if ('ch' === $kind) {
-            if (1 !== preg_match('/^(.+):(\d{1,9})$/', $rest, $m) || !Patterns::validRoom($m[1])) {
+            if (1 !== preg_match('/^(.+):(\d{1,9})$/D', $rest, $m) || !Patterns::validRoom($m[1])) {
                 return false;
             }
 
@@ -924,8 +1281,8 @@ final class Realtime
 
     /**
      * Where the routes serve a browser file, in the folder of this version: `realtime.js`, `realtime-worker.js`,
-     * `realtime-rooms.min.js`, `realtime-rooms-e2ee.worker.js`, `realtime-ui.min.js` or `realtime-ui-streams.min.js`.
-     * For a page with no bundler: `<script type="module">import { connect } from '<?= $realtime->fileAt( 'realtime.js' ) ?>'`.
+     * `realtime-rooms.min.js`, `realtime-rooms-e2ee.worker.js`, `realtime-ui.min.js`, `realtime-ui-streams.min.js`,
+     * `realtime-ui-recording.min.js` or `hls.light.min.js`. For a page with no bundler: `<script type="module">import { connect } from '<?= $realtime->fileAt( 'realtime.js' ) ?>'`.
      */
     public function fileAt(string $name): string
     {
@@ -1111,7 +1468,7 @@ final class Realtime
         $timestamp = $header('X-WordPlus-Timestamp');
         $signature = $header('X-WordPlus-Signature');
 
-        if ($header('X-WordPlus-Site') !== $this->site || '' === $signature || 1 !== preg_match('/^\d{1,12}$/', $timestamp)) {
+        if ($header('X-WordPlus-Site') !== $this->site || '' === $signature || 1 !== preg_match('/^\d{1,12}$/D', $timestamp)) {
             return ['status' => 401, 'body' => ['code' => 'missing_signature']];
         }
 
@@ -1227,6 +1584,17 @@ final class Realtime
         $users = array_values(array_unique(array_map('strval', array_filter((array) ($event['users'] ?? []), static fn ($u) => (is_int($u) || is_string($u)) && self::known($u)))));
         $data = $event['data'] ?? null;
         $except = empty($event['except']) ? [] : ['except' => (string) $event['except']];
+
+        if (!empty($event['everyone'])) {
+            if ([] !== $rooms || [] !== $users) {
+                throw new RealtimeError('bad_request');
+            }
+
+            $this->signed('POST', '/wordplus/realtime/emit', ['everyone' => true, 'event' => $name, 'data' => $data] + $except);
+
+            return [];
+        }
+
         $sealing = (!array_key_exists('seal', $event) || false !== $event['seal']) && $this->sealing();
         $out = [];
         $plain = [];
@@ -1406,11 +1774,47 @@ final class Realtime
     }
 
     /** @return array<string, mixed>|null */
-    private function askCaller(int|string $user, string $name, int|string $withUser, string $role): ?array
+    private function askCaller(int|string $user, string $name, int|string $withUser, string $role, bool $proven = false): ?array
     {
         $found = $this->callRules->match($name);
 
-        return null === $found ? null : $this->callAnswer(($found['value']['rule'])($user, $withUser, $found['params'], $name, ['role' => $role]), $user);
+        if (null === $found) {
+            if ($proven) {
+                return $this->callAnswer(true, $user);
+            }
+
+            $this->warnNoRule('calls', $name);
+
+            return null;
+        }
+
+        return $this->callAnswer(($found['value']['rule'])($user, $withUser, $found['params'], $name, ['role' => $role]), $user);
+    }
+
+    /**
+     * A name no rule owns, said once in the server's log with what to declare: the page hears only `no_rule` or
+     * `forbidden`, as a user refused does, and a developer who forgot the rule has nothing else to go on. The first names
+     * of a kind are enough, however many a page makes up.
+     */
+    private function warnNoRule(string $kind, string $name): void
+    {
+        $said = $kind.':'.$name;
+
+        if (isset($this->warnedNoRule[$said]) || count($this->warnedNoRule) >= 20) {
+            return;
+        }
+
+        $this->warnedNoRule[$said] = true;
+
+        $token = ['calls' => 'callToken( $user, $to )', 'groupCalls' => 'groupCallToken( $user, $name )', 'streams' => 'streamToken( $user, $name )'][$kind] ?? null;
+
+        if (null !== $token) {
+            error_log('wordplus-realtime: no rule matches "'.$name.'", so it is refused. Start it with a token from your own route: $realtime->'.$token.'.');
+
+            return;
+        }
+
+        error_log('wordplus-realtime: no rule matches "'.$name.'", so it is refused. Declare it: $realtime->'.$kind."( 'pattern:{id}', \$rule ).");
     }
 
     /**
@@ -1443,38 +1847,243 @@ final class Realtime
         return $this->keys->proof($kind.'|'.$call.'|'.$first.'|'.self::idPart($pair[0]).'|'.self::idPart($pair[1]).'|'.self::idPart($user));
     }
 
+    /** Whether `$me` hosts the group call `$name`: a rule that owns the name decides, else the proof a token of this server's own gave the page. */
+    private function hostsCall(string $name, int|string $me, mixed $held): bool
+    {
+        $found = $this->groupRules->match($name);
+
+        if (null === $found) {
+            return $this->holdsGroupProof('host', $name, $me, $held);
+        }
+
+        $answer = ($found['value']['rule'])($me, $found['params'], $name);
+
+        return is_array($answer) && !empty($answer['admin']);
+    }
+
     /**
-     * What a host does to someone else in the group call `$name`, from its call screen: the call's rule asked again for
-     * the user, who must be its host (`admin`), then the act through WordPlus Cloud: `mute` their microphone, `speak`
-     * or `listen` (permit()'s `publish`), `remove`. `['done' => …]`, whether it changed anything.
+     * What a host does in the group call `$name`, from its call screen: the call's rule asked again for the user, who
+     * must be its host (`admin`), then the act through WordPlus Cloud, as the host acts of Better Messages are:
+     *
+     * - `mute` turns their microphone off once, and they may turn it on again. `hold_mic` holds it off until the call
+     *   ends or `release_mic`, through a reload too.
+     * - `speak` and `listen` (permit()'s `publish`) hold until the call ends, or the other one, or a mode switch.
+     * - `remove` is a kick, which also keeps them out of a locked call. `ban` keeps them out for `minutes` (by default
+     *   until the call ends, at most a week), and `unban` lets them in again.
+     * - `rules` sets the room's rules (`rules`: any of `mode`, `locked`, `muted`), which hold until the call empties.
+     * - `ask` asks them to turn on a camera or microphone (`devices`), and keeps nothing.
+     * - `end` ends the call for everyone and lets go of everything it held but a ban given minutes.
+     * - `spotlight` or `unspotlight` (spotlight()), which may name the host themselves, and `unspotlight` no one, for everyone.
+     *
+     * `rules` and `end` name no user (null). `['done' => …]`, whether it changed anything (true for an act that always
+     * takes), with an ask's `id` and the rules now. Each act names the host as `by`, for the `call.moderated` webhook.
+     *
+     * @param array<string, mixed> $request
      *
      * @return array<string, mixed>
      */
-    private function moderateCall(mixed $name, mixed $act, mixed $target, int|string $me): array
+    private function moderateCall(mixed $name, mixed $act, mixed $target, int|string $me, mixed $held, array $request): array
     {
-        $user = self::callUser($target);
+        $spotlights = 'spotlight' === $act || 'unspotlight' === $act;
+        $unnamed = 'rules' === $act || 'end' === $act;
+        $everyone = ('unspotlight' === $act || $unnamed) && null === $target;
+        $user = $everyone ? null : self::callUser($target);
 
-        if (!Patterns::validRoom($name) || !in_array($act, self::MODERATION_ACTS, true) || null === $user || $user === $me) {
+        if (!Patterns::validRoom($name) || !in_array($act, self::MODERATION_ACTS, true)) {
+            return ['denied' => 'bad_request'];
+        }
+
+        if (($unnamed && null !== $target) || (null === $user && !$everyone) || ($user === $me && !$spotlights)) {
+            return ['denied' => 'bad_request'];
+        }
+
+        // What an act carries beside its user, checked before anyone is asked.
+        $minutes = $request['minutes'] ?? null;
+
+        if ('ban' === $act && null !== $minutes && !(is_int($minutes) && $minutes >= 1 && $minutes <= self::BAN_MOST_MINUTES)) {
+            return ['denied' => 'bad_request'];
+        }
+
+        $devices = 'ask' === $act ? self::askedDevices($request['devices'] ?? null) : null;
+        $rules = 'rules' === $act ? self::rulesChange($request['rules'] ?? null) : null;
+
+        if (('ask' === $act && null === $devices) || ('rules' === $act && null === $rules)) {
+            return ['denied' => 'bad_request'];
+        }
+
+        if (!$this->hostsCall($name, $me, $held)) {
+            return ['denied' => 'forbidden'];
+        }
+
+        $call = $this->call($name);
+        $by = ['by' => $me];
+
+        try {
+            if ($spotlights) {
+                return ['done' => $call->spotlight($user, 'spotlight' === $act)];
+            }
+
+            if ('rules' === $act) {
+                return ['done' => true, 'rules' => $call->rules($rules, $by)];
+            }
+
+            if ('end' === $act) {
+                $call->end($by);
+
+                return ['done' => true];
+            }
+
+            switch ($act) {
+                case 'mute':
+                    return ['done' => $call->mute($user, 'microphone', $by)];
+                case 'hold_mic':
+                    $call->mute($user, 'microphone', ['hold' => true] + $by);
+
+                    return ['done' => true];
+                case 'release_mic':
+                    $call->unmute($user, $by);
+
+                    return ['done' => true];
+                case 'remove':
+                    return ['done' => $call->remove($user, $by)];
+                case 'ban':
+                    $call->ban($user, (null === $minutes ? [] : ['minutes' => $minutes]) + $by);
+
+                    return ['done' => true];
+                case 'unban':
+                    return ['done' => $call->unban($user, $by)];
+                case 'ask':
+                    return ['done' => true, 'id' => $call->ask($user, $devices, $me)['id']];
+                default:
+                    // The screen's Make Listener and its promotion hold, as in Better Messages.
+                    return ['done' => $call->permit($user, ['publish' => 'speak' === $act, 'hold' => true] + $by)];
+            }
+        } catch (RealtimeError $e) {
+            // What the host is to hear of, in the call screen's words: a fifth person in the spotlight, a host banned,
+            // an ask again within 30 s, someone no longer in the call.
+            return ['denied' => in_array($e->errorCode, self::PASSED_ON, true) ? $e->errorCode : 'server'];
+        }
+    }
+
+    /**
+     * A hand in the group call `$name`, from its call screen: a user's own up or down (no `user`), which anyone the
+     * call's rule lets in may raise (or, with no rule, the `member` proof of a token of this server's own), or a host
+     * lowering someone's hand (`user`), or everyone's (`user` null). Hands are kept until lowered or their owner leaves.
+     *
+     * @return array<string, mixed>
+     */
+    private function handInCall(mixed $name, mixed $up, bool $named, mixed $target, int|string $me, mixed $host, mixed $member): array
+    {
+        if (!Patterns::validRoom($name) || !is_bool($up)) {
+            return ['denied' => 'bad_request'];
+        }
+
+        $call = $this->call($name);
+
+        try {
+            if (!$named) {
+                $found = $this->groupRules->match($name);
+                $in = null === $found
+                    ? $this->holdsGroupProof('member', $name, $me, $member)
+                    : null !== $this->callAnswer(($found['value']['rule'])($me, $found['params'], $name), $me);
+
+                return $in ? ['done' => $call->hand($me, $up)] : ['denied' => 'forbidden'];
+            }
+
+            // A host lowers another's hand, or everyone's.
+            $user = null === $target ? null : self::callUser($target);
+
+            if ($up || (null !== $target && null === $user)) {
+                return ['denied' => 'bad_request'];
+            }
+
+            if (!$this->hostsCall($name, $me, $host)) {
+                return ['denied' => 'forbidden'];
+            }
+
+            return ['done' => null === $user ? $call->lowerHands(['by' => $me]) > 0 : $call->hand($user, false)];
+        } catch (RealtimeError $e) {
+            return ['denied' => in_array($e->errorCode, self::PASSED_ON, true) ? $e->errorCode : 'server'];
+        }
+    }
+
+    /**
+     * An ask's devices, each once: `camera`, `microphone` or both; null for anything else.
+     *
+     * @return list<string>|null
+     */
+    private static function askedDevices(mixed $devices): ?array
+    {
+        if (!is_array($devices) || !array_is_list($devices) || [] === $devices || count($devices) > 2) {
+            return null;
+        }
+
+        foreach ($devices as $device) {
+            if ('camera' !== $device && 'microphone' !== $device) {
+                return null;
+            }
+        }
+
+        return count(array_unique($devices)) === count($devices) ? $devices : null;
+    }
+
+    /**
+     * A change of a call's rules: at least one of `mode`, `locked` and `muted`, and nothing else; null for anything else.
+     *
+     * @return array<string, bool|string>|null
+     */
+    private static function rulesChange(mixed $rules): ?array
+    {
+        if (!is_array($rules) || [] === $rules || array_is_list($rules) || [] !== array_diff(array_keys($rules), ['mode', 'locked', 'muted'])) {
+            return null;
+        }
+
+        if (array_key_exists('mode', $rules) && 'broadcast' !== $rules['mode'] && 'participatory' !== $rules['mode']) {
+            return null;
+        }
+
+        foreach (['locked', 'muted'] as $flag) {
+            if (array_key_exists($flag, $rules) && !is_bool($rules[$flag])) {
+                return null;
+            }
+        }
+
+        return $rules;
+    }
+
+    /**
+     * Record or stop recording the group call `$name`, from its call screen's Host Controls (`['call' => …, 'record' =>
+     * 'start']`, `['call' => …, 'record' => 'stop', 'recording' => …]`): the call's rule asked again for the user, who
+     * must be allowed `record` (its `admin` where it says nothing of it), then WordPlus Cloud. `['recording' => ['id',
+     * 'state']]`, or why not: `no_credits`, `not_included`, `already_recording` and the rest, as the server refuses it.
+     *
+     * @return array<string, mixed>
+     */
+    private function recordCall(mixed $name, mixed $action, mixed $recording, int|string $me, mixed $held = null): array
+    {
+        if (!Patterns::validRoom($name) || ('start' !== $action && 'stop' !== $action)) {
+            return ['denied' => 'bad_request'];
+        }
+
+        if ('stop' === $action && (!is_string($recording) || 1 !== preg_match('/^[A-Za-z0-9_-]{8,32}$/D', $recording))) {
             return ['denied' => 'bad_request'];
         }
 
         $found = $this->groupRules->match($name);
         $answer = null === $found ? null : ($found['value']['rule'])($me, $found['params'], $name);
 
-        if (!is_array($answer) || empty($answer['admin'])) {
+        if (!(null === $found ? $this->holdsGroupProof('recorder', $name, $me, $held) : is_array($answer) && !empty($answer['record'] ?? $answer['admin'] ?? false))) {
             return ['denied' => 'forbidden'];
         }
 
-        $call = $this->call($name);
-
         try {
-            return ['done' => match ($act) {
-                'mute' => $call->mute($user, 'microphone'),
-                'remove' => $call->remove($user),
-                default => $call->permit($user, ['publish' => 'speak' === $act]),
-            }];
-        } catch (RealtimeError) {
-            return ['denied' => 'server'];
+            if ('stop' === $action) {
+                return ['recording' => ['id' => $recording, 'state' => $this->recordings()->stop($recording)]];
+            }
+
+            return ['recording' => $this->recordings()->start(['call' => $name, 'by' => $me])];
+        } catch (RealtimeError $e) {
+            return ['denied' => $e->errorCode];
         }
     }
 
@@ -1586,7 +2195,7 @@ final class Realtime
         [$kind, $rest] = explode(':', $label, 2);
         $newest = '';
 
-        if ('ch' === $kind && 1 === preg_match('/^(.+):\d{1,9}$/', $rest, $m)) {
+        if ('ch' === $kind && 1 === preg_match('/^(.+):\d{1,9}$/D', $rest, $m)) {
             $newest = $this->keys->roomLabel($m[1]);
         } elseif (isset($this->kinds[$kind]) && null !== $this->kinds[$kind][1]) {
             $newest = (string) ($this->kinds[$kind][1])($rest, $label);
@@ -1610,7 +2219,18 @@ final class Realtime
         $now = $this->now();
         $exp = $now + self::clamp((int) ($this->options['call_token_ttl'] ?? self::CALL_TTL), 60, self::CALL_TTL);
 
-        return ['token' => self::jwt(['iss' => $this->site, 'iat' => $now, 'exp' => $exp] + $claims, hash_hmac('sha256', self::CALLS_LABEL, $this->secret, true)), 'exp' => $exp];
+        return ['token' => self::jwt(['iss' => $this->site, 'iat' => $now, 'ms' => self::msWithin($now), 'exp' => $exp] + $claims, hash_hmac('sha256', self::CALLS_LABEL, $this->secret, true)), 'exp' => $exp];
+    }
+
+    /**
+     * `ms`, as a room token has it: when a token was signed to the millisecond, for one signed in the same second as a
+     * removal. Only within `iat`, as a clock given in the options, or the second turning just now, may say another.
+     */
+    private static function msWithin(int $now): int
+    {
+        $ms = (int) floor(microtime(true) * 1000);
+
+        return intdiv($ms, 1000) === $now ? $ms : $now * 1000;
     }
 
     /**
@@ -1629,11 +2249,12 @@ final class Realtime
         $found = $this->streamRules->match($name);
 
         if (null === $found) {
+            $this->warnNoRule('streams', $name);
+
             return ['denied' => 'forbidden'];
         }
 
-        $signedIn = self::known($user);
-        $answer = ($found['value']['rule'])($signedIn ? $user : null, $found['params'], $name);
+        $answer = ($found['value']['rule'])(self::known($user) ? $user : null, $found['params'], $name);
 
         if (is_string($answer)) {
             $answer = ['role' => $answer];
@@ -1643,6 +2264,21 @@ final class Realtime
             return ['denied' => 'forbidden'];
         }
 
+        return $this->signStream($name, $user, $answer, $found['value']['settings'], $found['params']);
+    }
+
+    /**
+     * A live stream's grant for this user, once a rule or the app's own route has said who they are in it.
+     *
+     * @param array<string, mixed>  $answer
+     * @param array<string, mixed>  $settings
+     * @param array<string, string> $params
+     *
+     * @return array<string, mixed>
+     */
+    private function signStream(string $name, int|string|null $user, array $answer, array $settings, array $params): array
+    {
+        $signedIn = self::known($user);
         $sub = $signedIn ? (string) $user : null;
 
         if (null === $sub ? 'viewer' !== $answer['role'] : 1 !== preg_match(self::STREAM_USER, $sub)) {
@@ -1653,8 +2289,6 @@ final class Realtime
         $named = is_array($info) && isset($info['name']) && is_string($info['name']) && '' !== $info['name'] ? mb_substr($info['name'], 0, 64) : null;
         $avatar = is_array($info) && isset($info['avatar']) && is_string($info['avatar']) && strlen($info['avatar']) <= 512 && str_starts_with($info['avatar'], 'https://') ? $info['avatar'] : null;
 
-        $params = $found['params'];
-        $settings = $found['value']['settings'];
         $setting = static fn (mixed $value): mixed => is_callable($value) ? $value($params) : $value;
         $chat = $setting($settings['chat'] ?? null) ?? [];
 
@@ -1667,7 +2301,7 @@ final class Realtime
             'src' => $answer['src'] ?? null, 'q' => $answer['quality'] ?? null,
             'stage' => $setting($settings['stage'] ?? null), 'offline' => $chat['offline'] ?? null, 'links' => $chat['links'] ?? null,
             'fresh' => $chat['fresh'] ?? null, 'people' => $setting($settings['people'] ?? null),
-            'reactions' => $setting($settings['reactions'] ?? null), 'iat' => $now, 'exp' => $exp,
+            'reactions' => $setting($settings['reactions'] ?? null), 'iat' => $now, 'ms' => self::msWithin($now), 'exp' => $exp,
         ];
 
         return ['token' => self::streamGrant($claims, hash_hmac('sha256', self::GRANT_KEY_LABEL, $this->secret, true)), 'exp' => $exp];
@@ -1822,10 +2456,12 @@ final class Realtime
         $history = null;
         $given = $options['history'] ?? null;
 
-        if (is_int($given) && $given > 0) {
-            $history = ['last' => min($given, self::MAX_HISTORY), 'days' => self::MAX_HISTORY_DAYS];
+        if ((is_int($given) || is_float($given)) && $given > 0) {
+            $history = ['last' => min((int) floor($given), self::MAX_HISTORY), 'days' => self::MAX_HISTORY_DAYS];
         } elseif (is_array($given) && (int) ($given['last'] ?? 0) > 0) {
-            $days = isset($given['days']) && is_numeric($given['days']) && (float) $given['days'] > 0 ? min((float) $given['days'], self::MAX_HISTORY_DAYS) : self::MAX_HISTORY_DAYS;
+            // In seconds, or in `days`, a part of one, as it was first written: what the token carries is a part of a day.
+            $days = isset($given['seconds']) && is_numeric($given['seconds']) ? (float) $given['seconds'] / 86400 : ($given['days'] ?? null);
+            $days = is_numeric($days) && (float) $days > 0 ? min((float) $days, self::MAX_HISTORY_DAYS) : self::MAX_HISTORY_DAYS;
             $history = ['last' => min((int) $given['last'], self::MAX_HISTORY), 'days' => $days];
         }
 
@@ -1902,7 +2538,7 @@ final class Realtime
     /** An attempt at a call, as a page names it. */
     private static function validAttempt(mixed $id): bool
     {
-        return is_string($id) && 1 === preg_match('/^[A-Za-z0-9_-]{8,64}$/', $id);
+        return is_string($id) && 1 === preg_match('/^[A-Za-z0-9_-]{8,64}$/D', $id);
     }
 
     /**
@@ -1931,11 +2567,11 @@ final class Realtime
             return 0 !== $user && abs($user) <= self::MAX_SAFE_INTEGER ? $user : null;
         }
 
-        if (!is_string($user) || 1 !== preg_match('/^[^\s\x00-\x1f\x7f]{1,64}$/u', $user)) {
+        if (!is_string($user) || 1 !== preg_match('/^[^\s\x00-\x1f\x7f]{1,64}$/Du', $user)) {
             return null;
         }
 
-        if (1 === preg_match('/^-?[1-9][0-9]*$/', $user) && strlen(ltrim($user, '-')) <= 16 && abs((int) $user) <= self::MAX_SAFE_INTEGER) {
+        if (1 === preg_match('/^-?[1-9][0-9]*$/D', $user) && strlen(ltrim($user, '-')) <= 16 && abs((int) $user) <= self::MAX_SAFE_INTEGER) {
             return (int) $user;
         }
 

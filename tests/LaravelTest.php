@@ -119,7 +119,7 @@ final class LaravelTest extends TestCase
         $this->postJson('/wordplus/realtime/auth', ['rooms' => ['orders.1', 'room.1', 'shop']])
             ->assertOk()
             ->assertJsonPath('denied', ['orders.1' => 'forbidden', 'room.1' => 'forbidden']);
-        $this->postJson('/wordplus/realtime/keys', ['labels' => []])->assertExactJson(['keys' => []]);
+        $this->postJson('/wordplus/realtime/keys', ['labels' => []])->assertExactJson(['keys' => [], 'app' => 's1500000007']);
     }
 
     #[DefineEnvironment('ownRoutes')]
@@ -158,7 +158,7 @@ final class LaravelTest extends TestCase
         $this->assertInstanceOf(\WordPlus\Realtime\Laravel\WordPlusBroadcaster::class, Broadcast::connection('wordplus'));
         $this->artisan('route:list')->assertSuccessful();
 
-        $this->expectExceptionMessage('site and secret are required');
+        $this->expectExceptionMessage('WORDPLUS_SITE and WORDPLUS_SECRET');
         app(Realtime::class)->config(null);
     }
 
@@ -267,6 +267,23 @@ final class LaravelTest extends TestCase
         $this->assertSame(['rooms' => ['news'], 'event' => 'hello', 'data' => ['a' => 1]], end(self::$sent)['body']);
     }
 
+    public function test_the_facade_names_every_method_an_app_calls_so_an_editor_and_a_static_check_know_them()
+    {
+        // What the package's own routes, the broadcaster and the queries call, never an app.
+        $internal = ['authorize', 'publicGrants', 'authorizeCall', 'callKey', 'keysAnswer', 'file', 'respondFile', 'address',
+            'routeOf', 'handle', 'webhook', 'respond', 'answerRequest', 'emitEvent', 'request', 'sealedFor', 'opened'];
+        $doc = (string) (new \ReflectionClass(RealtimeFacade::class))->getDocComment();
+        preg_match_all('/@method static \S+ (\w+)\(/', $doc, $named);
+
+        // An instance's methods: the facade hands its calls to the app's Realtime, never to the class.
+        $public = (new \ReflectionClass(\WordPlus\Realtime\Realtime::class))->getMethods(\ReflectionMethod::IS_PUBLIC);
+        $methods = array_map(static fn (\ReflectionMethod $m) => $m->getName(), array_filter($public, static fn (\ReflectionMethod $m) => ! $m->isStatic()));
+        $forApps = array_values(array_diff(array_filter($methods, static fn ($m) => ! str_starts_with($m, '__')), $internal));
+
+        $this->assertSame([], array_values(array_diff($forApps, $named[1])), 'methods an app calls that the facade does not name');
+        $this->assertSame([], array_values(array_diff($named[1], $methods)), 'names in the facade that Realtime does not have');
+    }
+
     public function test_the_browser_files_come_from_the_package_routes_without_a_session()
     {
         $at = app(Realtime::class)->fileAt('realtime-worker.js');
@@ -282,6 +299,37 @@ final class LaravelTest extends TestCase
         $this->get('/wordplus/realtime/files/realtime.js')->assertOk()->assertHeader('ETag');
         $this->get('/wordplus/realtime/files/'.explode('/', $at)[4].'/composer.json')->assertNotFound();
         $this->get('/wordplus/realtime/files/../composer.json')->assertNotFound();
+    }
+
+    public function test_the_config_file_sets_what_new_realtime_takes_the_tokens_lifetimes_the_headers_and_the_rooms_worker()
+    {
+        // A Laravel app could set these only by binding the singleton again.
+        $this->app['config']->set('wordplus-realtime.token_ttl', 120);
+        $this->app['config']->set('wordplus-realtime.call_token_ttl', 90);
+        $this->app['config']->set('wordplus-realtime.headers', ['X-Team' => '4']);
+        $this->app['config']->set('wordplus-realtime.rooms_worker', '/e2ee.worker.js');
+        $this->app->forgetInstance(Realtime::class);
+        RealtimeServiceProvider::profileUsing(static fn ($id) => ['name' => 'Agent '.$id]);
+
+        $identity = self::claims(RealtimeFacade::identity(42)['token']);
+        $this->assertSame(120, $identity['exp'] - $identity['iat']);
+
+        $config = RealtimeFacade::config(null);
+        $this->assertSame('/e2ee.worker.js', $config['roomsWorker']);
+        $this->assertSame('4', ((array) $config['auth']['headers'])['X-Team']);
+    }
+
+    public function test_has_keys_using_cuts_a_user_off_from_the_keys()
+    {
+        RealtimeServiceProvider::profileUsing(static fn ($id) => ['name' => 'Agent '.$id]);
+        RealtimeServiceProvider::hasKeysUsing(static fn ($id) => 42 !== (int) $id);
+
+        try {
+            $this->assertSame(['keys' => [], 'app' => 's1500000007'], RealtimeFacade::keysAnswer([], 42));
+            $this->assertNotSame([], RealtimeFacade::keysAnswer([], 43)['keys']);
+        } finally {
+            RealtimeServiceProvider::hasKeysUsing(null);
+        }
     }
 
     public function test_a_user_who_hides_their_status_is_never_shown_online()

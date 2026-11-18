@@ -1,0 +1,273 @@
+#!/usr/bin/env php
+<?php
+
+// The package's command, for the first minutes of an app and for when something doesn't connect:
+//
+//   vendor/bin/wordplus-realtime init                your app's key and secret into .env, and a local key made for you
+//   vendor/bin/wordplus-realtime check [address]     whether your keys work with WordPlus Cloud, and your routes there
+
+declare(strict_types=1);
+
+const WORDPLUS_API = 'https://rest.wordplus.cloud';
+const WORDPLUS_PUBLISH_LABEL = 'wordplus-realtime publish v1';
+const WORDPLUS_USAGE = <<<'TEXT'
+Usage:
+  vendor/bin/wordplus-realtime init [--app <key>] [--secret <secret>]   set your app up here
+  vendor/bin/wordplus-realtime check [address] [--base <path>]          see whether it works, such as http://localhost:8000
+
+TEXT;
+
+/** `--app value` and `--app=value`, as an array. */
+function wordplus_flags(array $args): array
+{
+    $out = [];
+    for ($i = 0; $i < count($args); ++$i) {
+        if (1 === preg_match('/^--([a-z-]+)(?:=(.*))?$/', $args[$i], $match)) {
+            $out[$match[1]] = $match[2] ?? ($args[++$i] ?? '');
+        }
+    }
+
+    return $out;
+}
+
+/** What a .env file sets, as far as this command needs: `NAME=value`, with quotes or not, a comment after a value left out. */
+function wordplus_env_of(string $file): array
+{
+    if (!is_file($file)) {
+        return [];
+    }
+    $out = [];
+    foreach (preg_split('/\r?\n/', (string) file_get_contents($file)) as $line) {
+        if (1 === preg_match('/^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*)$/', $line, $match)) {
+            $value = trim((string) preg_replace('/\s+#.*$/', '', $match[2]));
+            $out[$match[1]] = (string) preg_replace('/^([\'"])(.*)\1$/', '$2', $value);
+        }
+    }
+
+    return $out;
+}
+
+/** Whether .gitignore covers a file, as far as its plain lines say: `.env*` and the like. */
+function wordplus_ignored(string $file): bool
+{
+    if (!is_file('.gitignore')) {
+        return false;
+    }
+    foreach (preg_split('/\r?\n/', (string) file_get_contents('.gitignore')) as $line) {
+        $pattern = ltrim(trim($line), '/');
+        if ('' !== $pattern && !str_starts_with($pattern, '#') && fnmatch($pattern, $file, FNM_PERIOD) || $pattern === $file) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function wordplus_ask(string $question): string
+{
+    if (!function_exists('posix_isatty') || !posix_isatty(STDIN)) {
+        return '';
+    }
+    echo $question;
+
+    return trim((string) fgets(STDIN));
+}
+
+function wordplus_init(array $given): int
+{
+    $have = wordplus_env_of('.env');
+    echo "Your app's key and secret are on its page in your WordPlus Cloud account: Apps → your app.\n";
+    echo "Your subscription and its Apps page: https://www.wordplus.cloud/pricing#apps\n\n";
+
+    $values = [
+        'WORDPLUS_SITE' => ($have['WORDPLUS_SITE'] ?? '') ?: (($given['app'] ?? '') ?: wordplus_ask('App key (public, such as s1500000007): ')),
+        'WORDPLUS_SECRET' => ($have['WORDPLUS_SECRET'] ?? '') ?: (($given['secret'] ?? '') ?: wordplus_ask('App secret (stays on your server): ')),
+        // It seals what goes through the cloud, which never sees it, so it is made here. A new one could not open what the old one sealed.
+        'WORDPLUS_LOCAL_KEY' => ($have['WORDPLUS_LOCAL_KEY'] ?? '') ?: bin2hex(random_bytes(32)),
+    ];
+
+    $missing = array_values(array_filter(array_keys($values), static fn (string $name) => !array_key_exists($name, $have)));
+    if ([] !== $missing) {
+        $old = is_file('.env') ? (string) file_get_contents('.env') : '';
+        $lead = '' !== $old && !str_ends_with($old, "\n") ? "\n" : '';
+        file_put_contents('.env', $lead.implode('', array_map(static fn (string $name) => $name.'='.$values[$name]."\n", $missing)), FILE_APPEND);
+        echo "\n  wrote    ".implode(', ', $missing)." into .env\n";
+    } else {
+        echo "\n  kept     .env, which has all three\n";
+    }
+    if (in_array('WORDPLUS_LOCAL_KEY', $missing, true)) {
+        echo "           Keep WORDPLUS_LOCAL_KEY as long as the app, the same on each of its servers: what it sealed needs it to open.\n";
+    }
+    if (!wordplus_ignored('.env')) {
+        $old = is_file('.gitignore') ? (string) file_get_contents('.gitignore') : '';
+        file_put_contents('.gitignore', ('' !== $old && !str_ends_with($old, "\n") ? "\n" : '').".env\n", FILE_APPEND);
+        echo "  added    .env to .gitignore: the secret and the local key must stay out of git.\n";
+    }
+
+    echo "\nNext: declare your rooms and mount the routes, as the guide for your framework shows: https://docs.wordplus.cloud/\n";
+    if ('' === $values['WORDPLUS_SITE'] || '' === $values['WORDPLUS_SECRET']) {
+        echo "\nThen fill in what is empty in .env.\n";
+    }
+    echo "\nThen see that it all works, with your app running:\n\n  vendor/bin/wordplus-realtime check http://localhost:8000\n\n";
+
+    return 0;
+}
+
+/** A request's status and body, a refusal's too; null when nothing answers. */
+function wordplus_request(string $url, string $method = 'GET', array $headers = [], ?string $body = null): ?array
+{
+    $context = stream_context_create(['http' => [
+        'method' => $method,
+        'header' => array_map(static fn (string $name, string $value) => $name.': '.$value, array_keys($headers), $headers),
+        'content' => $body ?? '',
+        'ignore_errors' => true,
+        'timeout' => 10,
+        'follow_location' => 0,
+    ]]);
+    $answer = @file_get_contents($url, false, $context);
+    if (false === $answer || !isset($http_response_header[0]) || 1 !== preg_match('/\s(\d{3})\s?/', $http_response_header[0], $match)) {
+        return null;
+    }
+
+    return [(int) $match[1], (string) $answer];
+}
+
+function wordplus_pass(string $text): void
+{
+    echo '  ok    '.$text."\n";
+}
+
+function wordplus_fail(string $text, int &$failures): void
+{
+    ++$failures;
+    echo '  FAIL  '.$text."\n";
+}
+
+/** What the signed usage route answers says whether WordPlus Cloud knows this app and its secret, and it changes nothing. */
+function wordplus_check_cloud(string $app, string $secret, string $api, int &$failures): void
+{
+    echo "\nWordPlus Cloud\n";
+    $path = '/wordplus/realtime/usage';
+    $timestamp = (string) time();
+    $signature = hash_hmac('sha256', $timestamp."\nGET\n".$path."\n".hash('sha256', ''), hash_hmac('sha256', WORDPLUS_PUBLISH_LABEL, $secret, true));
+    $answered = wordplus_request($api.$path, 'GET', ['X-WordPlus-Site' => $app, 'X-WordPlus-Timestamp' => $timestamp, 'X-WordPlus-Signature' => $signature]);
+
+    if (null === $answered) {
+        wordplus_fail('could not reach '.$api.". Check this machine's connection to it.", $failures);
+
+        return;
+    }
+    [$status, $raw] = $answered;
+    $answer = json_decode($raw, true);
+    $answer = is_array($answer) ? $answer : [];
+    if (200 === $status && !empty($answer['ok'])) {
+        $now = $answer['connections']['now'] ?? null;
+        $limit = $answer['connections']['limit'] ?? null;
+        wordplus_pass('it knows your app, and your secret is right'.(null === $now ? '' : ' ('.$now.' connected now'.($limit ? ' of '.$limit : '').')'));
+
+        return;
+    }
+    $refusals = [
+        'unknown_site' => "it doesn't know this app key. Check WORDPLUS_SITE against your app's page in WordPlus Cloud (Apps).",
+        'bad_signature' => "your secret is wrong for this app. Check WORDPLUS_SECRET against your app's page in WordPlus Cloud (Apps).",
+        'stale_signature' => "this machine's clock is off by more than five minutes.",
+        'not_included' => 'the plan of this app does not include realtime.',
+    ];
+    $error = $answer['error'] ?? null;
+    wordplus_fail($refusals[$error] ?? 'it answered '.$status.($error ? ' ('.$error.')' : '').'.', $failures);
+}
+
+/** The routes as a page asks them, with no user: the keys route names the app, and GET serves the browser files. */
+function wordplus_check_routes(string $address, string $app, string $base, int &$failures): void
+{
+    echo "\nYour routes at ".$address.$base."\n";
+    $keys = wordplus_request($address.$base.'/keys', 'POST', ['Content-Type' => 'application/json'], '{"labels":[]}');
+    if (null === $keys) {
+        wordplus_fail('nothing answers at '.$address.'. Is your app running there?', $failures);
+
+        return;
+    }
+    [$status, $raw] = $keys;
+    $named = json_decode($raw, true)['app'] ?? null;
+    if (200 === $status && $named) {
+        if ('' !== $app && $named !== $app) {
+            wordplus_fail('they name the app '.$named.', and your keys here say '.$app.': your server reads other values than these.', $failures);
+        } else {
+            wordplus_pass('the keys route answers, naming your app');
+        }
+    } elseif (200 === $status) {
+        wordplus_fail('the keys route answers with no app key: update the package on your server.', $failures);
+    } elseif (419 === $status) {
+        // Laravel's CSRF check, which a page passes with the token @wordplusRealtime gives it, and this command has none.
+        wordplus_pass("the keys route is there, behind Laravel's CSRF check, which your pages pass with @wordplusRealtime");
+    } elseif (401 === $status || 403 === $status) {
+        wordplus_fail('the keys route answered '.$status.'. Something in front of it asks for a sign-in: let '.$base.'/* through with the session.', $failures);
+    } else {
+        wordplus_fail('the keys route answered '.$status.'. Laravel adds them by itself under /wordplus/realtime. Plain PHP: your front controller calls $realtime->respond(). The guide for your framework shows it.', $failures);
+    }
+
+    $file = wordplus_request($address.$base.'/files/realtime-worker.js', 'HEAD');
+    if (200 === ($file[0] ?? null)) {
+        wordplus_pass('the browser files are served');
+    } else {
+        wordplus_fail('the browser files answered '.($file[0] ?? 'nothing').'. Your routes serve them on GET under '.$base."/files/. An app that serves them itself has `'files' => false`, and this one can pass.", $failures);
+    }
+}
+
+function wordplus_check(?string $address, string $base): int
+{
+    $env = array_merge(wordplus_env_of('.env'), array_filter(getenv(), static fn ($value) => is_string($value)));
+    $app = $env['WORDPLUS_SITE'] ?? '';
+    $secret = $env['WORDPLUS_SECRET'] ?? '';
+    $localKey = $env['WORDPLUS_LOCAL_KEY'] ?? '';
+    $failures = 0;
+    echo "Your keys\n";
+
+    if (1 === preg_match('/^[A-Za-z0-9._-]{2,}$/D', $app)) {
+        wordplus_pass('WORDPLUS_SITE is '.$app);
+    } else {
+        wordplus_fail("WORDPLUS_SITE is missing. It is your app's key, on its page in WordPlus Cloud (Apps).", $failures);
+    }
+    if ('' !== $secret) {
+        wordplus_pass('WORDPLUS_SECRET is there');
+    } else {
+        wordplus_fail("WORDPLUS_SECRET is missing. It is your app's secret, on its page in WordPlus Cloud (Apps).", $failures);
+    }
+    if (1 === preg_match('/^[0-9a-f]{64}$/D', $localKey)) {
+        wordplus_pass('WORDPLUS_LOCAL_KEY is 64 hex characters');
+    } else {
+        wordplus_fail(('' === $localKey ? 'WORDPLUS_LOCAL_KEY is missing.' : "WORDPLUS_LOCAL_KEY isn't 64 hex characters.").' Make one with `openssl rand -hex 32`, and keep it as long as the app.', $failures);
+    }
+
+    if ('' !== $app && '' !== $secret) {
+        wordplus_check_cloud($app, $secret, rtrim(($env['WORDPLUS_REALTIME_API'] ?? '') ?: WORDPLUS_API, '/'), $failures);
+    }
+    if (null !== $address) {
+        wordplus_check_routes(rtrim($address, '/'), $app, $base, $failures);
+    } else {
+        echo "\nGive the address your app runs on to check your routes too: vendor/bin/wordplus-realtime check http://localhost:8000\n";
+    }
+
+    echo $failures > 0 ? "\n".$failures." to fix.\n" : "\nAll good.\n";
+
+    return $failures > 0 ? 1 : 0;
+}
+
+$args = array_slice($argv, 1);
+$command = $args[0] ?? null;
+$rest = array_slice($args, 1);
+
+if (in_array($command, ['help', '--help', '-h'], true) || in_array('--help', $rest, true) || in_array('-h', $rest, true)) {
+    echo WORDPLUS_USAGE;
+    exit(0);
+}
+if ('init' === $command) {
+    exit(wordplus_init(wordplus_flags($rest)));
+}
+if ('check' === $command) {
+    // Laravel's routes are under /wordplus/realtime, and other apps' under /api/realtime by default.
+    $base = wordplus_flags($rest)['base'] ?? (is_file('artisan') ? '/wordplus/realtime' : '/api/realtime');
+    exit(wordplus_check(isset($rest[0]) && !str_starts_with($rest[0], '--') ? $rest[0] : null, $base));
+}
+echo WORDPLUS_USAGE;
+exit(null === $command ? 0 : 1);

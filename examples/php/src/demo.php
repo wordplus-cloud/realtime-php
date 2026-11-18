@@ -78,6 +78,24 @@ function demo_open_shop(string $address): int
     return $number;
 }
 
+/** A new visitor signed in as the Ann of their shop (demo_open_shop()), in the session: her id. */
+function demo_start(): int
+{
+    // The visitor address as the proxy in front saw it: the last of X-Forwarded-For, the one it added. The ones before
+    // it are whatever the visitor sent.
+    $forwarded = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR'] ?? '');
+    $ann = demo_open_shop(trim(end($forwarded)) ?: ($_SERVER['REMOTE_ADDR'] ?? 'local')) * 100 + 34;
+    // A request that only reads the session closed it at once: opened again to write.
+    if (PHP_SESSION_ACTIVE !== session_status()) {
+        session_start();
+    }
+    session_regenerate_id(true);
+    $_SESSION['user'] = $ann;
+    session_write_close();
+
+    return $ann;
+}
+
 /** What a person page draws around the shop. */
 function demo_frame(array $me): array
 {

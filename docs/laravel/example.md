@@ -8,8 +8,9 @@ A whole shop on Laravel, in the package `examples/laravel`: sign in as Ann (supp
 |---|---|
 | The order of Ben follows as Ann moves it on, and Ben alone gets a notice | `orders.{order}` in `routes/channels.php`, the `OrderUpdated` event broadcast `toOthers()`, and `Realtime::toUser()` ([sending](sending.md)) |
 | The chat of Ann and Ben, with typing, reactions and read ticks | `<chat-room>` on the `chat.{a}.{b}` room, which lets pages [send](events.md) them. The app keeps the conversation from the webhook and gives it back from `GET /chat/messages` ([keeping the conversation](events.md#keeping-the-conversation)). The name and picture of the other side above it from the [directory](encryption.md#your-users) |
-| Who is in the shop, with a call button for each | `<online-list>` on the `shop` [presence](presence.md) room, the name and role of each member |
-| The daily meeting | `<room-button>`, a [group call](calls.md). `AppServiceProvider` says who may call whom |
+| Who is in the shop, with a call button for each | `<online-list>` on the `shop` [presence](presence.md) room, the name and role of each member. Its call buttons, and those of the members, ask `GET /api/call-token`, a route of the app (`TokenController`), which lets two people of the shop call when one of them is staff, and answers `Realtime::callToken()` ([who may call](calls.md#who-may-call)) |
+| The daily meeting | `<group-call-button>`, a [group call](calls.md). It asks `GET /api/meeting-token?id=daily`, which lets in everyone of the shop with `Realtime::groupCallToken()` |
+| The live show | `<live-stream>`, a [live stream](streams.md) Ann presents and everyone else watches, with a token from `GET /api/show-token?id=mugs`: `Realtime::streamToken()`, Ann the host |
 | The order timeline, and what the cloud carried of it | the order room [history](rooms.md#history-and-nothing-lost). `GET /orders/{order}/wire` seals the update as the app sends it, with the room key ([encryption](encryption.md)) |
 | How many are looking at the mugs | `product.{id}`, a public channel with `'count' => true` ([counting](presence.md#counting)) |
 | The webhooks the app got | `Realtime::on('*')` in `AppServiceProvider`, which sends each on to the shop `webhooks` room ([webhooks](sending.md#webhooks)) |
@@ -35,9 +36,10 @@ Open it in two browsers (or a private window), sign in as Ann in one and Ben in 
 | `routes/channels.php` | the rooms of the order, the chat, the shop, the product and the webhooks: who may join, and what each keeps and allows |
 | `app/Events/OrderUpdated.php` | the order update, broadcast now |
 | `app/Http/Controllers/ShopController.php` | the shop page, moving the order on, and what the cloud carried of it |
-| `app/Providers/AppServiceProvider.php` | who may call whom, the daily meeting, and the webhooks |
+| `app/Http/Controllers/TokenController.php` | the routes that start a call, the daily meeting and the live show: each its own check, then a token |
+| `app/Providers/AppServiceProvider.php` | the webhooks |
 | `app/Support/Shop.php` | the shops, by number: their people, order and room names |
 | `app/Support/Demo.php`, `app/Http/Middleware/DemoWindow.php` | the demo part alone (`WORDPLUS_DEMO=1`): a shop for each visitor, its windows, and the frame around the page |
 | `resources/views/shop.blade.php` | `@wordplusRealtime`, and the shop data for the page |
-| `resources/js/shop.js` | the page: `connect()`, the order, the product, the chat, who is in the shop, the webhooks, the meeting and the call screen. The same file runs the shop in every example |
+| `resources/js/shop.js` | the page: `connect()`, the order, the product, the chat, who is in the shop, the webhooks, the meeting, the show and the call screen. The same file runs the shop in every example |
 | `database/seeders/DatabaseSeeder.php` | Ann (34), Ben (42) and Cara (43), and the order of Ben |
